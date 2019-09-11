@@ -17,15 +17,15 @@ WORKDIR /
 COPY alpine.patch /
 RUN patch -p1 < alpine.patch
 
-ENV XEN_VERSION 4.12.0
-ENV XEN_SOURCE=https://downloads.xenproject.org/release/xen/${XEN_VERSION}/xen-${XEN_VERSION}.tar.gz
+ENV XEN_VERSION 4.13.0
+ENV XEN_SOURCE=https://github.com/xen-project/xen/archive/master.tar.gz
 
 # Download and verify xen
 #TODO: verify Xen
 RUN \
     [ -f xen-${XEN_VERSION}.tar.gz ] || curl -fsSLO ${XEN_SOURCE} && \
-    gzip -d xen-${XEN_VERSION}.tar.gz && \
-    cat xen-${XEN_VERSION}.tar | tar --absolute-names -x && mv /xen-${XEN_VERSION} /xen
+    gzip -d master.tar.gz && \
+    cat master.tar | tar --absolute-names -x && mv /xen-* /xen
 
 # Apply local patches
 COPY patches-${XEN_VERSION} /patches
