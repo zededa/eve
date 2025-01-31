@@ -118,7 +118,6 @@ export ZARCH
 CROSS ?=
 ifneq ($(HOSTARCH),$(ZARCH))
 CROSS = 1
-$(warning "WARNING: We are assembling an $(ZARCH) image on $(HOSTARCH). Things may break.")
 endif
 
 DOCKER_ARCH_TAG=$(ZARCH)
@@ -390,10 +389,10 @@ else
         #kube container will not be in non-kubevirt builds
         PKGS_$(ZARCH)=$(shell find pkg -maxdepth 1 -type d | grep -Ev "eve|alpine|sources|kube|external-boot-image$$")
         # nvidia platform requires more space
-        ifeq ($(PLATFORM),nvidia)
-            ROOTFS_MAXSIZE_MB=450
-        else
+        ifeq (, $(findstring nvidia,$(PLATFORM)))
             ROOTFS_MAXSIZE_MB=270
+        else
+            ROOTFS_MAXSIZE_MB=450
         endif
 endif
 

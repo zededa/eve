@@ -128,10 +128,13 @@ func objectInfoTask(ctxPtr *zedagentContext, triggerInfo <-chan infoForObjectKey
 				sub := ctxPtr.getconfigCtx.subContentTreeStatus
 				if c, err = sub.Get(infoForKeyMessage.objectKey); err == nil {
 					ctStatus := c.(types.ContentTreeStatus)
-					uuidStr := ctStatus.Key()
-					PublishContentInfoToZedCloud(ctxPtr, uuidStr, &ctStatus,
-						ctxPtr.iteration, infoDest)
-					ctxPtr.iteration++
+					// We publish the info to zedcloud only if it is a local contenttree
+					if ctStatus.IsLocal {
+						uuidStr := ctStatus.Key()
+						PublishContentInfoToZedCloud(ctxPtr, uuidStr, &ctStatus,
+							ctxPtr.iteration, infoDest)
+						ctxPtr.iteration++
+					}
 				}
 			case info.ZInfoTypes_ZiBlobList:
 				// publish blob info
@@ -386,7 +389,7 @@ func PublishDeviceInfoToZedCloud(ctx *zedagentContext, dest destinationBitset) {
 			swInfo)
 	}
 
-	// Reporting all zpools in Strorage Info
+	// Reporting all zpools in Storage Info
 	if persist.ReadPersistType() == types.PersistZFS {
 		zfsPoolStatusMap := ctx.subZFSPoolStatus.GetAll()
 		for _, el := range zfsPoolStatusMap {
@@ -620,7 +623,7 @@ func PublishDeviceInfoToZedCloud(ctx *zedagentContext, dest destinationBitset) {
 		info.MaintenanceModeReason(ctx.maintModeReason))
 
 	// Watchdog
-	ReportDeviceInfo.HardwareWatchdogPresent = getHarwareWatchdogPresent(ctx)
+	ReportDeviceInfo.HardwareWatchdogPresent = getHardwareWatchdogPresent(ctx)
 
 	// This is also reported in State
 	ReportDeviceInfo.RebootInprogress = ctx.rebootCmd || ctx.deviceReboot

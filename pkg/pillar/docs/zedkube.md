@@ -38,13 +38,6 @@ When the application uses passthrough on ethernet ports, zedkube creates a speci
 
 This collection is specific for the kubernetes status and stats. Although EVE has the device info, domain status, etc, but kubernetes has a different sets of 'nodes', 'pods', 'vmis', cluster storage stats, etc. This will be reported by zedkube through 'KubeClusterInfo' publication. It will also have some simple non-EVE App related POD status.
 
-### kubenodeop
-
-kubenodeop handles cordoning, uncordoning, and draining of clustered eve-os nodes.
-Any given node could be hosting one or more longhorn volume replicas and thus could be the rebuild source for other node replicas.
-A drain operation should be performed before any Node Operation / Node Command which can cause an extended outage of a node such as a reboot, shutdown, reset.
-kubenodeop handles NodeDrainRequest objects which zedkube subscribes to, initiates the drain, and publishes NodeDrainStatus objects.
-
 ## Applications under Kubevirt Mode
 
 ### Handle Domain Apps Status in domainmgr
@@ -52,6 +45,38 @@ kubenodeop handles NodeDrainRequest objects which zedkube subscribes to, initiat
 When the application is launched and managed in KubeVirt mode, the Kubernetes cluster is provisioned for this application, being a VMI (Virtual Machine Instance) replicaSet object or a Pod replicaSet object. It uses a declarative approach to manage the desired state of the applications. The configurations are saved in the Kubernetes database for the Kubernetes controller to use to ensure the objects eventually achieve the correct state if possible. Any particular VMI/Pod state of a domain may not be in working condition at the time when EVE domainmgr checks. In the domainmgr code running in KubeVirt mode, if it can not contact the Kubernetes API server to query about the application, or if the application itself has not be started yet in the cluster, the kubervirt.go will return the 'Unknown' status back. It will keep a 'Unknown' status starting timestamp per application. If the 'Unknown' status lasts longer then 5 minutes, the status functions in kubevirt.go will return 'Halting' status back to domainmgr. The timestamp will be cleared once it can get the application status from the kubernetes.
 
 ## Kubernetes Node Draining
+
+### Description
+
+As a part of kubevirt-eve we have multiple cluster nodes each hosting app workloads and volume replicas.
+zedkube implements defer for eve mgmt config operations which will result in unavailability of storage
+replicas until the cluster volume is not running on a single replica.  This defer is implemented 
+through cordoning, uncordoning, and draining of clustered eve-os nodes.
+
+Any given node could be hosting one or more longhorn volume replicas and thus could be the rebuild source for other node replicas.
+A drain operation should be performed before any Node Operation / Node Command which can cause an extended outage of a node such as a reboot, shutdown, reset.
+kubenodeop handles NodeDrainRequest objects which zedkube subscribes to, initiates the drain, and publishes NodeDrainStatus objects.
+
+An example:
+
+1. Node 1 outage and recovers.
+1. Before volumes complete rebuilding on node 1 there is a node 2 outage and recovery.
+1. Volumes begin rebuilding replicas on nodes 1 and 2. Only available rebuild source is on node 3.
+1. User initiated request to reboot/shutdown/update eve-os on node 3.
+1. That config request is set to defer until replicas are rebuilt on the other nodes.
+
+At a high level the eve-side workflow looks like this:
+
+1. eve config received requesting reboot/shutdown/baseos-image-change to node 1
+1. drain requested for node 1
+1. zedkube cordons node 1 so that new workloads are blocked from scheduling on that node.
+1. zedkube initiates a kubernetes drain of that node removing workloads
+1. As a part of drain, PDB (Pod Disruption Budget) at longhorn level determines local replica is the last online one.
+1. Drain waits for volume replicas to rebuild across the cluster.
+1. Drain completes and NodeDrainStatus message sent to continue original config request.
+1. On the next boot event zedkube nodeOnBootHealthStatusWatcher() waits until the local kubernetes node comes online/ready for the first time on each boot event and uncordons it, allowing workloads to be scheduled.
+
+Note: For eve baseos image updates this path waits until a new baseos image is fully available locally (LOADED or INSTALLED) and activated before beginning drain.
 
 ### kubeapi
 
@@ -201,3 +226,42 @@ The statefulset must be deleted.
   zgrep 'kubevirt_node_drain_completion_time_seconds' /persist/newlog/keepSentQueue/dev.log.1725511530990.gz | jq -r .content | jq -r .msg | cut -d ':' -f 2
   s34.559219
   ...
+
+### Application Tracker or App-Tracker
+
+In the Edge-Node Clustering setup, there are multiple EVE nodes handling the applications in a distributed way to prepare and handle the kubernetes cluster Pods and VMIs. The deployed application is downloaded onto all the nodes in the cluster, same for the cluster Network Instance and Volume Instance. Each node handles a different way to the application depending on the node is the Designated Node for the App, or if the kubernetes scheduling has scheduled the application to another node, etc. It is not easy to debug the distributed system when there is an issue encountered.
+
+The service 'zedkube' offers an App-Tracker http service, by offering the URL on the cluster node prefix IP address with the port number 12346. This prefix IP and port is already being used across the network in cluster to query the node cluster status when the node is being converted from single node into the cluster mode. The App-Tracker is using the same endpoint with a different URL to display the page of application status in the node or in the entire cluster.
+
+With the URL `http://<cluster-intf-ip>:12346/app/<app name or uuid>`
+it will return the Application state being published by each relevant microservices in pillar and the cluster status. Given the AppInstanceConfig data, we can gather the volume instances and network instances information, and further explore the volume and network related states. The Json file includes those items:
+
+- EdgeNode Info
+- EdgeNode Cluster Status
+- Kubernetes lease Information (for Cluster status reporter)
+- last 10 lines of /persist/kubelog/k3s-install.log
+- App Instance Config Info
+- Volume Config Info
+- Network Instance Status
+- EdgeNode Cluster App Status by zedkube
+- App Network Config by zedmanager
+- App Network Status by zedrouter
+- App Volume Status
+- App ContentTree Status
+- App Network Config by zedmanager
+- App Instance Status by zedmanager
+- App Domain Config my zedmanager
+- App Domain Status by domainmgr
+- App Domain Metrics by domainmgr
+- App Disk Metrics by volumemgr
+
+For entire cluster status of the App, with the URL `http://<cluster-intf-ip>:12346/cluster-app/<app name or uuid>`
+The first node specified by the 'cluster-intf-ip' will gather the above App status on the node, then it will query the cluster on all the cluster-intf-ip of the other nodes on the cluster. Then it sends out the http query to those endpoints with the 'app name or app uuid' in URL to goather the APP status on those nodes, and merge the json results for the query reply to the user.
+
+To use this, one example can be to use Edgeview with TCP command for the first node. First find out the cluster-intf-ip of the node on the cluster, for instance it is '10.244.244.3', then do:
+
+  edgeview.sh tcp/10.244.244.3:12346
+
+then go to a web browser (or use 'curl'), enter url: `http://localhost:9001/app/<app name or uuid>` for the particular node status of the App, or enter url: `http://localhost:9001/cluster-app/<app name or uuid>` for the cluster status of the App.
+
+If the \<app name or uuid\> is empty in the URL, then the query reply only returns the cluster related status. (the above first 4 items in the list)
