@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lf-edge/eve/pkg/pillar/agentbase"
@@ -38,6 +39,12 @@ var (
 	log    *base.LogObject
 )
 
+// GetKubePodsError is used to check and handle get kube pods error
+type GetKubePodsError struct {
+	getKubePodsErrorTime    time.Time
+	processedErrorCondition bool
+}
+
 type zedkube struct {
 	agentbase.AgentBase
 	globalConfig             *types.ConfigItemValueMap
@@ -57,6 +64,7 @@ type zedkube struct {
 	pubEdgeNodeClusterStatus pubsub.Publication
 	pubENClusterAppStatus    pubsub.Publication
 	pubKubeClusterInfo       pubsub.Publication
+	pubLeaderElectInfo       pubsub.Publication
 
 	subNodeDrainRequestZA  pubsub.Subscription
 	subNodeDrainRequestBoM pubsub.Subscription
@@ -72,12 +80,15 @@ type zedkube struct {
 	clusterIPIsReady         bool
 	nodeuuid                 string
 	nodeName                 string
-	isKubeStatsLeader        bool
-	inKubeLeaderElection     bool
+	isKubeStatsLeader        atomic.Bool
+	inKubeLeaderElection     atomic.Bool
+	electionFuncRunning      atomic.Bool
+	leaderIdentity           string
 	electionStartCh          chan struct{}
 	electionStopCh           chan struct{}
 	statusServer             *http.Server
 	statusServerWG           sync.WaitGroup
+	getKubePodsError         GetKubePodsError
 	drainOverrideTimer       *time.Timer
 
 	// Config Properties for Drain
@@ -196,6 +207,16 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	}
 	zedkubeCtx.pubKubeClusterInfo = pubKubeClusterInfo
 
+	pubLeaderElectInfo, err := ps.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName: agentName,
+			TopicType: types.KubeLeaderElectInfo{},
+		})
+	if err != nil {
+		log.Fatal(err)
+	}
+	zedkubeCtx.pubLeaderElectInfo = pubLeaderElectInfo
+
 	// Look for global config such as log levels
 	subGlobalConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		AgentName:     "zedagent",
@@ -260,8 +281,8 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	subEdgeNodeInfo.Activate()
 
 	// start the leader election
-	zedkubeCtx.electionStartCh = make(chan struct{})
-	zedkubeCtx.electionStopCh = make(chan struct{})
+	zedkubeCtx.electionStartCh = make(chan struct{}, 1)
+	zedkubeCtx.electionStopCh = make(chan struct{}, 1)
 	go zedkubeCtx.handleLeaderElection()
 
 	// Wait for the certs, and nodeInfo which are needed to decrypt the token inside the
