@@ -34,8 +34,6 @@ jobs:
             arch: arm64
           - arch: amd64
             platform: nvidia-jp5
-          - arch: amd64
-            platform: nvidia-jp6
     steps:
       - name: Starting Report
         run: |
