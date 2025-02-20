@@ -617,10 +617,14 @@ func PublishDeviceInfoToZedCloud(ctx *zedagentContext, dest destinationBitset) {
 
 	// EVE needs to fill deprecated MaintenanceMode until it is removed
 	ReportDeviceInfo.MaintenanceMode = ctx.maintenanceMode
-	ReportDeviceInfo.MaintenanceModeReason = info.MaintenanceModeReason(ctx.maintModeReason)
+	// if we are in maintenance mode, this must have at least one reason, but
+	// better safe than sorry.
+	if len(ctx.maintModeReasons) > 0 {
+		ReportDeviceInfo.MaintenanceModeReason = info.MaintenanceModeReason(ctx.maintModeReasons[0])
+	}
 	// For backward compatibility added new field
 	ReportDeviceInfo.MaintenanceModeReasons = append(ReportDeviceInfo.MaintenanceModeReasons,
-		info.MaintenanceModeReason(ctx.maintModeReason))
+		infoMaintModeReason(ctx.maintModeReasons)...)
 
 	// Watchdog
 	ReportDeviceInfo.HardwareWatchdogPresent = getHardwareWatchdogPresent(ctx)
@@ -1303,7 +1307,7 @@ func getDeviceState(ctx *zedagentContext) types.DeviceState {
 	if ctx.maintenanceMode {
 		return types.DEVICE_STATE_MAINTENANCE_MODE
 	}
-	if isUpdating(ctx) {
+	if isUpdating(ctx) || isKubeClusterUpdating(ctx) {
 		return types.DEVICE_STATE_BASEOS_UPDATING
 	}
 	if ctx.rebootCmd || ctx.deviceReboot {

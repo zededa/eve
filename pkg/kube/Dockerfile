@@ -20,13 +20,20 @@ COPY cert-gen /plugins/cert-gen
 WORKDIR /plugins/cert-gen
 RUN GO111MODULE=on CGO_ENABLED=0 go build -v -ldflags "-s -w" -o /out/usr/bin/cert-gen .
 
+COPY update-component /plugins/update-component
+WORKDIR /plugins/update-component
+RUN GO111MODULE=on go build -v -ldflags "-s -w" -mod=vendor -o /out/usr/bin/update-component .
+
 FROM scratch
 COPY --from=build /out/ /
 COPY cluster-init.sh /usr/bin/
 COPY cluster-utils.sh /usr/bin/
 COPY cgconfig.conf /etc
 
+# upgrades
 COPY cluster-update.sh /usr/bin/
+COPY update-component/expected_versions.yaml /etc/
+COPY update-component/settings_longhorn.yaml /etc/
 
 # k3s
 COPY install-etcdctl.sh /usr/bin/
@@ -43,7 +50,7 @@ COPY external-boot-image.tar /etc/
 
 # Longhorn config
 COPY longhorn-utils.sh /usr/bin/
-COPY lh-cfg-v1.6.2.yaml /etc/
+COPY lh-cfg-v1.6.3.yaml /etc/
 COPY iscsid.conf /etc/iscsi/
 COPY longhorn-generate-support-bundle.sh /usr/bin/
 COPY nsmounter /usr/bin/

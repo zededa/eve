@@ -40,11 +40,11 @@ ENV BUILD_PKGS mkinitfs grep patch make coreutils musl-dev gcc g++ perl \
     cryptsetup-dev go lddtree git
 ENV PKGS mtools dosfstools libarchive-tools sgdisk e2fsprogs util-linux \
     squashfs-tools coreutils tar dmidecode smartmontools libaio libaio-dev \
-    perl glib zlib libusb curl xz pciutils usbutils hdparm ncurses-dev jq \
+    glib zlib libusb curl xz pciutils usbutils hdparm ncurses-dev jq \
     wireless-tools libxrandr eudev-libs sudo fio iperf3 sysstat \
     lm-sensors acpi iw libdrm hwinfo dhclient e2fsprogs-extra \
     libgcc pixman libvncserver musl-utils \
-    qemu-system-x86_64 tpm2-tss-dev tpm2-tss-esys tpm2-tss-fapi tpm2-tss-rc \
+    tpm2-tss-dev tpm2-tss-esys tpm2-tss-fapi tpm2-tss-rc \
     kmod-libs tpm2-tss-sys tpm2-tss-tctildr tpm2-abrmd libblkid cryptsetup-libs
 RUN eve-alpine-deploy.sh
 
