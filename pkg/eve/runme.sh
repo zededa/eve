@@ -6,6 +6,12 @@ exec 3>&1
 exec 1>&2
 
 OUTPUT_IMG=/tmp/output.img
+DEFAULT_LIVE_IMG_SIZE=592
+DEFAULT_INSTALLER_IMG_SIZE=592
+DEFAULT_NVIDIA_IMG_SIZE=900
+DEFAULT_KUBEVIRT_IMG_SIZE=2048
+DEFAULT_EVALUATION_INSTALLER_IMG_SIZE=2500
+DEFAULT_EVALUATION_LIVE_IMG_SIZE=2000
 
 bail() {
   echo "$@"
@@ -101,8 +107,14 @@ Optionally you can specify platform:
 
  -p <platform>
 
-This specifies a platform for this image: none (default),
-imx8mq_evk are all valid options.
+This specifies a platform for this image, e.g.:
+
+default (no platform provided), imx8mq_evk, imx8mp_pollux are all valid
+options.
+
+Note that NVIDIA images are only valid for a specific plataform. For
+instance: nvidia-jp6 images cannot be used with any other platform other
+than nvidia-jp6. The same applies for nvidia-jp5.
 
 Example:
 docker run --rm lfedge/eve -f raw -p imx8mq_evk live > live.raw
@@ -116,6 +128,8 @@ __EOT__
   exit 0
 }
 
+# $1 - offset in bytes
+# $2 - partition list
 create_efi_raw() {
   rm -rf /parts
   ln -s /bits /parts
@@ -137,6 +151,9 @@ do_build_config() {
 
 do_live() {
   PART_SPEC="efi conf imga"
+  if [ "$PLATFORM" = "evaluation" ]; then
+    PART_SPEC="efi conf imga imgb imgc"
+  fi
   # each live image is expected to have a soft serial number that
   # typically gets provisioned by an installer -- since we're
   # shortcutting the installer step here we need to generate it
@@ -147,13 +164,13 @@ do_live() {
      IMAGE_UUID=$(uuidgen | tee /tmp/soft_serial)
      mcopy -o -i /bits/config.img /tmp/soft_serial ::/soft_serial
   fi
-  create_efi_raw "${1:-592}" "$PART_SPEC"
+  create_efi_raw "${1:-${DEFAULT_LIVE_IMG_SIZE}}" "$PART_SPEC"
   dump "$OUTPUT_IMG" live.raw
   echo "$IMAGE_UUID" >&2
 }
 
 do_installer_raw() {
-  create_efi_raw "${1:-592}" "efi conf_win installer inventory_win"
+  create_efi_raw "${1:-${DEFAULT_INSTALLER_IMG_SIZE}}" "efi conf_win installer inventory_win"
   dump "$OUTPUT_IMG" installer.raw
 }
 
@@ -161,11 +178,11 @@ do_installer_raw() {
 # common base for other usages like do_installer_iso and do_installer_net
 create_installer_iso() {
   mkdir -p /installer_root
-  unsquashfs -f -d /installer_root /bits/installer.img 1>&2
+  cp /bits/installer.img /installer_root/
   if [ -e /bits/config.img ]; then
       cp /bits/config.img /installer_root/
   fi
-  tar -C /installer_root -cf - . | VOLUME_LABEL=EVEISO /make-efi installer
+  tar -C /installer_root -cf - . | VOLUME_LABEL=EVEISO IN_IMAGE=installer.img IN_FORMAT=squashfs /make-efi installer
   rm -rf /installer_root
 }
 
@@ -175,9 +192,15 @@ do_installer_iso() {
 }
 
 do_installer_net() {
+  if [ "$(uname -m)" = "riscv64" ]; then
+    IPXE_IMG="/ipxe.riscv64"
+  else
+    IPXE_IMG="/ipxe.efi"
+  fi
   # net installer depends on installer.iso
   rm -rf /installer /parts
   mkdir -p /installer
+  cp "$IPXE_IMG" /installer
   cp /bits/ipxe.efi.cfg /installer
   mkdir -p /installer/EFI/BOOT
   cp /bits/EFI/BOOT/BOOT*EFI /installer/EFI/BOOT/
@@ -203,16 +226,56 @@ do_sbom() {
   cat /bits/*.spdx.json >&3
 }
 
+get_image_platform() {
+  cat /bits/eve_platform || bail "Cannot read platform from /bits/eve_platform"
+}
+
+get_image_hv() {
+  if [ ! -f "/bits/eve_version" ]; then
+    bail "File /bits/eve_version does not exist"
+  fi
+  awk -F '-' '{print $(NF-1)}' < /bits/eve_version || bail "Failed to extract HV from /bits/eve_version"
+}
+
+# $1 - image platform
 prepare_for_platform() {
-    case "$PLATFORM" in
-    imx8m*) #shellcheck disable=SC2039
-        cat /bits/bsp-imx/NXP-EULA-LICENSE.txt
-        [ -n "$ACCEPT" ] || bail "You need to read and accept the EULA before you can continue. Use the --accept-license argument."
+    platform="$1"
+    # Parse platform argument
+    case "$platform" in
+    imx8) #shellcheck disable=SC2039
         cp /bits/bsp-imx/"$PLATFORM"-flash.bin /bits/imx8-flash.bin
         [ -n "$(ls /bits/bsp-imx/*.dtb 2> /dev/null)" ] && cp /bits/bsp-imx/*.dtb /bits/boot
         ;;
+    nvidia-jp*)
+        DEFAULT_LIVE_IMG_SIZE=$DEFAULT_NVIDIA_IMG_SIZE
+        DEFAULT_INSTALLER_IMG_SIZE=$DEFAULT_NVIDIA_IMG_SIZE
+        ;;
+    evaluation)
+        DEFAULT_LIVE_IMG_SIZE=$DEFAULT_EVALUATION_LIVE_IMG_SIZE
+        DEFAULT_INSTALLER_IMG_SIZE=$DEFAULT_EVALUATION_INSTALLER_IMG_SIZE
+        ;;
     *) #shellcheck disable=SC2039,SC2104
         break
+        ;;
+    esac
+    export PLATFORM
+}
+
+# $1 - hypervisor
+prepare_for_hv() {
+    hv="$1"
+    case "$hv" in
+    kvm|xen|acrn)
+        ;;
+    kubervir)
+        # Override image sizes with the max of the two values
+        if [ "$DEFAULT_KUBEVIRT_IMG_SIZE" -gt "$DEFAULT_INSTALLER_IMG_SIZE" ]; then
+            DEFAULT_INSTALLER_IMG_SIZE="$DEFAULT_KUBEVIRT_IMG_SIZE"
+            DEFAULT_LIVE_IMG_SIZE="$DEFAULT_KUBEVIRT_IMG_SIZE"
+        fi
+        ;;
+    *) #shellcheck disable=SC2039,SC2104
+        bail "Unsupported hypervisor: $hv"
         ;;
     esac
 }
@@ -236,9 +299,6 @@ while true; do
              shift
           fi
           shift
-          #shellcheck disable=SC3057
-          BASEPLATFORM="${PLATFORM:0:5}"
-          [ "$PLATFORM" != "none" ] && [ "$BASEPLATFORM" != "imx8m" ] && bail "Unknown platform: $PLATFORM"
           ;;
      --accept-license*) #shellcheck disable=SC2039,SC3060
           ACCEPT=1
@@ -249,11 +309,31 @@ while true; do
    esac
 done
 
+image_platform=$(get_image_platform)
+image_hv=$(get_image_hv)
+
+# only for IMX8 -p and --accept-license are mandatory
+if [ "$image_platform" = "imx8" ]; then
+   [ -z "$PLATFORM" ] && bail "Error: platform (-p) argument is required for IMX8 images."
+   if [ -n "$ACCEPT" ]; then
+     cat /bits/bsp-imx/NXP-EULA-LICENSE.txt
+     bail "Error: you must accept the EULA to create IMX8 images. Use --accept-license option."
+   fi
+else
+   # image_platform cannot be unknown and it is always valid
+   # however if -p argument is not the same as image_platform
+   # print an error
+   [ -n "$PLATFORM" ] && [ "$PLATFORM" != "$image_platform" ] && bail "Error: platform (-p) argument '$PLATFORM' does not match image platform '$image_platform'."
+   PLATFORM="${image_platform}"
+fi
+
 # If we were not told to do anything, print help and exit with success
 [ $# -eq 0 ] && do_help
 
-# Prepare some files for selected platform
-prepare_for_platform
+# Prepare some files and variables for selected platform
+prepare_for_platform "${image_platform}"
+# Prepare some files and variables for selected hypervisor
+prepare_for_hv "${image_hv}"
 
 # Let's see what was it that we were asked to do
 ACTION="do_$1"

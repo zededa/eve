@@ -22,9 +22,9 @@ import (
 	zconfig "github.com/lf-edge/eve-api/go/config"
 	"github.com/lf-edge/eve-api/go/evecommon"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
+	"github.com/lf-edge/eve/pkg/pillar/controllerconn"
 	"github.com/lf-edge/eve/pkg/pillar/flextimer"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -187,7 +187,8 @@ func handleEdgeNodeCertDelete(ctxArg interface{}, key string,
 func controllerCertsTask(ctx *zedagentContext, triggerCerts <-chan struct{}) {
 
 	log.Functionln("starting controller certificate fetch task")
-	retry := !getCertsFromController(ctx, "initial")
+	success := getCertsFromController(ctx, "initial")
+	retry := !success
 
 	wdName := agentName + "ccerts"
 
@@ -213,7 +214,6 @@ func controllerCertsTask(ctx *zedagentContext, triggerCerts <-chan struct{}) {
 	ctx.getconfigCtx.certTickerHandle = periodicTicker
 
 	for {
-		success := true
 		select {
 		case <-triggerCerts:
 			start := time.Now()
@@ -233,12 +233,12 @@ func controllerCertsTask(ctx *zedagentContext, triggerCerts <-chan struct{}) {
 		if retry && success {
 			log.Noticef("getCertsFromController succeeded; switching to long timer %d seconds",
 				ctx.globalConfig.GlobalValueInt(types.CertInterval))
-			updateCertTimer(ctx.globalConfig.GlobalValueInt(types.CertInterval),
+			updateTaskTimer(ctx.globalConfig.GlobalValueInt(types.CertInterval),
 				ctx.getconfigCtx.certTickerHandle)
 			retry = false
 		} else if !retry && !success {
 			log.Noticef("getCertsFromController failed; switching to short timer")
-			updateCertTimer(shortTime,
+			updateTaskTimer(shortTime,
 				ctx.getconfigCtx.certTickerHandle)
 			retry = true
 		}
@@ -256,7 +256,7 @@ func verifySigningCertNewest(ctx *zedagentContext, certByte []byte) error {
 		err = fmt.Errorf("verifyCertNewest: x509.ParseCertificate() failed: %w", err)
 		return err
 	}
-	err = zedcloud.LoadSavedServerSigningCert(zedcloudCtx)
+	err = ctrlClient.LoadSavedServerSigningCert()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// Certificates were not loaded, accept
@@ -265,7 +265,7 @@ func verifySigningCertNewest(ctx *zedagentContext, certByte []byte) error {
 		err = fmt.Errorf("verifyCertNewest: LoadSavedServerSigningCert() failed: %w", err)
 		return err
 	}
-	oldCert := zedcloudCtx.ServerSigningCert
+	oldCert := ctrlClient.GetServerSigningCert()
 	if newCert.NotBefore.Before(oldCert.NotBefore) {
 		err = fmt.Errorf("verifyCertNewest: received old signing certificate, new.NotBefore '%v' < '%v' old.NotBefore",
 			newCert.NotBefore, oldCert.NotBefore)
@@ -279,15 +279,17 @@ func verifySigningCertNewest(ctx *zedagentContext, certByte []byte) error {
 // not changed or the update was successfully applied.
 // False is returned if the function failed to fetch/verify/unmarshal certs.
 func requestCertsByURL(ctx *zedagentContext, certURL string, desc string,
-	requireSigningCertNewest bool) bool {
+	requireSigningCertNewest, expectNoConn bool) bool {
 	log.Functionf("getCertsFromController started for %s", desc)
-	ctxWork, cancel := zedcloud.GetContextForAllIntfFunctions(zedcloudCtx)
+	ctxWork, cancel := ctrlClient.GetContextForAllIntfFunctions()
 	defer cancel()
 
-	const bailOnHTTPErr = false
-	const withNetTracing = false
-	rv, err := zedcloud.SendOnAllIntf(ctxWork, zedcloudCtx, certURL, 0, nil, 0,
-		bailOnHTTPErr, withNetTracing)
+	rv, err := ctrlClient.SendOnAllIntf(ctxWork, certURL, nil, controllerconn.RequestOptions{
+		WithNetTracing: false,
+		BailOnHTTPErr:  false,
+		Iteration:      0,
+		SuppressLogs:   expectNoConn,
+	})
 	if err != nil {
 		switch rv.Status {
 		case types.SenderStatusUpgrade:
@@ -303,7 +305,9 @@ func requestCertsByURL(ctx *zedagentContext, certURL string, desc string,
 			log.Noticef("%s trigger", rv.Status.String())
 			triggerControllerCertEvent(ctx)
 		default:
-			log.Errorf("getCertsFromController failed: %s", err)
+			if !expectNoConn {
+				log.Errorf("getCertsFromController failed: %s", err)
+			}
 		}
 		return false
 	}
@@ -323,12 +327,12 @@ func requestCertsByURL(ctx *zedagentContext, certURL string, desc string,
 		return false
 	}
 
-	if err := zedcloud.ValidateProtoContentType(certURL, rv.HTTPResp); err != nil {
-		log.Errorf("getCertsFromController: resp header error")
+	if err := controllerconn.ValidateProtoContentType(rv.HTTPResp); err != nil {
+		log.Error("getCertsFromController: resp header error")
 		return false
 	}
 	if len(rv.RespContents) > 0 {
-		err = zedcloud.RemoveAndVerifyAuthContainer(zedcloudCtx, &rv, true)
+		err = ctrlClient.RemoveAndVerifyAuthContainer(&rv, true)
 		if err != nil {
 			log.Errorf("RemoveAndVerifyAuthContainer failed: %s", err)
 			return false
@@ -336,7 +340,7 @@ func requestCertsByURL(ctx *zedagentContext, certURL string, desc string,
 	}
 
 	// validate the certificate message payload
-	signingCertBytes, ret := zedcloud.VerifyProtoSigningCertChain(log, rv.RespContents)
+	signingCertBytes, ret := ctrlClient.VerifyProtoSigningCertChain(rv.RespContents)
 	if ret != nil {
 		log.Errorf("getCertsFromController: verify err %v", ret)
 		switch rv.Status {
@@ -368,9 +372,9 @@ func requestCertsByURL(ctx *zedagentContext, certURL string, desc string,
 	}
 
 	// write the signing cert to file
-	if err := zedcloud.SaveServerSigningCert(zedcloudCtx, signingCertBytes); err != nil {
+	if err := ctrlClient.SaveServerSigningCert(signingCertBytes); err != nil {
 		errStr := fmt.Sprintf("%v", err)
-		log.Errorf("getCertsFromController: " + errStr)
+		log.Error("getCertsFromController: " + errStr)
 		return false
 	}
 
@@ -386,11 +390,11 @@ func requestCertsByURL(ctx *zedagentContext, certURL string, desc string,
 // attempts is to fallback to retrieve certs from the LOC.
 func getCertsFromController(ctx *zedagentContext, desc string) bool {
 	// not V2API
-	if !zedcloud.UseV2API() {
+	if !ctrlClient.UsingV2API() {
 		log.Noticef("getCertsFromController not V2API!")
 		return false
 	}
-	url := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API,
+	url := controllerconn.URLPathString(serverNameAndPort, ctrlClient.UsingV2API(),
 		nilUUID, "certs")
 
 	// Controller is in the power to push us outdated certs.
@@ -398,13 +402,14 @@ func getCertsFromController(ctx *zedagentContext, desc string) bool {
 	// insubordition.
 	requireSigningCertNewest := false
 
-	rv := requestCertsByURL(ctx, url, desc, requireSigningCertNewest)
-	if !rv {
+	expectNoConn := ctx.airgapMode
+	rv := requestCertsByURL(ctx, url, desc, requireSigningCertNewest, expectNoConn)
+	if !rv && !expectNoConn {
 		log.Warningf("getCertsFromController: fetching certs from controller failed")
 	}
 	if !rv && ctx.getconfigCtx.sideController.locConfig != nil {
 		locURL := ctx.getconfigCtx.sideController.locConfig.LocURL
-		url = zedcloud.URLPathString(locURL, zedcloudCtx.V2API,
+		url = controllerconn.URLPathString(locURL, ctrlClient.UsingV2API(),
 			nilUUID, "certs")
 
 		// Don't let LOC push us outdated certs
@@ -412,7 +417,8 @@ func getCertsFromController(ctx *zedagentContext, desc string) bool {
 
 		// Request certs from LOC if previous request has failed and LOC
 		// configuration exists and is valid
-		rv = requestCertsByURL(ctx, url, desc, requireSigningCertNewest)
+		expectNoConn = false
+		rv = requestCertsByURL(ctx, url, desc, requireSigningCertNewest, expectNoConn)
 		log.Warningf("getCertsFromController: certs were requested from the LOC with the result '%v'",
 			rv)
 	}
@@ -452,7 +458,7 @@ func publishEdgeNodeCertsToController(ctx *zedagentContext) {
 	var attestReq = &attest.ZAttestReq{}
 
 	// not V2API
-	if !zedcloud.UseV2API() {
+	if !ctrlClient.UsingV2API() {
 		ctx.publishedEdgeNodeCerts = true
 		return
 	}
@@ -497,7 +503,7 @@ func publishEdgeNodeCertsToController(ctx *zedagentContext) {
 	}
 
 	log.Tracef("publishEdgeNodeCertsToController, sending %s", attestReq)
-	sendAttestReqProtobuf(attestReq, ctx.cipherCtx.iteration)
+	sendAttestReqProtobuf(ctx, attestReq, ctx.cipherCtx.iteration)
 	log.Tracef("publishEdgeNodeCertsToController: after send, total elapse sec %v",
 		time.Since(startPubTime).Seconds())
 	ctx.cipherCtx.iteration++
@@ -508,7 +514,8 @@ func publishEdgeNodeCertsToController(ctx *zedagentContext) {
 // Try all (first free, then rest) until it gets through.
 // Each iteration we try a different port for load spreading.
 // For each port we try all its local IP addresses until we get a success.
-func sendAttestReqProtobuf(attestReq *attest.ZAttestReq, iteration int) {
+func sendAttestReqProtobuf(
+	ctx *zedagentContext, attestReq *attest.ZAttestReq, iteration int) {
 	data, err := proto.Marshal(attestReq)
 	if err != nil {
 		log.Fatal("SendInfoProtobufStr proto marshaling error: ", err)
@@ -516,21 +523,24 @@ func sendAttestReqProtobuf(attestReq *attest.ZAttestReq, iteration int) {
 
 	deferKey := "attest:" + devUUID.String()
 
-	attestURL := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API,
+	attestURL := controllerconn.URLPathString(serverNameAndPort, ctrlClient.UsingV2API(),
 		devUUID, "attest")
 	buf := bytes.NewBuffer(data)
 	if buf == nil {
 		log.Fatal("malloc error")
 	}
-	size := int64(proto.Size(attestReq))
 
-	//We queue the message and then get the highest priority message to send.
-	//If there are no failures and defers we'll send this message,
-	//but if there is a queue we'll retry sending the highest priority message.
+	// We queue the message and then get the highest priority message to send.
+	// If there are no failures and defers we'll send this message,
+	// but if there is a queue we'll retry sending the highest priority message.
 	// Since attest messages can fail if there is a certificate mismatch
-	// we set ignoreErr to allow other messages to be sent as well.
-	zedcloudCtx.DeferredEventCtx.SetDeferred(deferKey, buf, size, attestURL,
-		false, false, true, attestReq.ReqType)
+	// we set IgnoreErr to allow other messages to be sent as well.
+	ctx.deferredEventQueue.SetDeferred(deferKey, buf, attestURL,
+		attestReq.ReqType, controllerconn.DeferredItemOpts{
+			BailOnHTTPErr:  false,
+			WithNetTracing: false,
+			IgnoreErr:      true,
+		})
 }
 
 // initialize cipher pubsub trigger handlers and channels
@@ -543,7 +553,7 @@ func cipherModuleInitialize(ctx *zedagentContext) {
 
 // start the task threads
 func cipherModuleStart(ctx *zedagentContext) {
-	if !zedcloud.UseV2API() {
+	if !ctrlClient.UsingV2API() {
 		log.Functionf("V2 APIs are still not enabled")
 		// we will run the tasks for watchdog
 	}

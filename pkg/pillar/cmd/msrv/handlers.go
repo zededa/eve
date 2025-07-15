@@ -5,7 +5,6 @@ package msrv
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -13,24 +12,37 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/lf-edge/eve/pkg/pillar/controllerconn"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/utils"
 	fileutils "github.com/lf-edge/eve/pkg/pillar/utils/file"
 	"github.com/lf-edge/eve/pkg/pillar/utils/netutils"
-	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 )
 
-type middlewareKeys int
-
-const (
-	patchEnvelopesContextKey middlewareKeys = iota
-	appUUIDContextKey
-)
+// Struct to generate the output JSON for Network Status and Metrics
+type networkStatusMetrics struct {
+	IfName              string // Interface's name
+	Up                  bool   // Is interface up?
+	TxBytes             uint64
+	RxBytes             uint64
+	TxDrops             uint64
+	RxDrops             uint64
+	TxPkts              uint64
+	RxPkts              uint64
+	TxErrors            uint64
+	RxErrors            uint64
+	TxACLDrops          uint64 // For implicit deny/drop at end
+	RxACLDrops          uint64 // For implicit deny/drop at end
+	TxACLRateLimitDrops uint64 // For all rate limited rules
+	RxACLRateLimitDrops uint64 // For all rate limited rules
+}
 
 func (msrv *Msrv) handleNetwork() func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -143,7 +155,7 @@ func (msrv *Msrv) handleOpenStack() func(http.ResponseWriter, *http.Request) {
 		if anConfig.MetaDataType != types.MetaDataOpenStack {
 			errorLine := fmt.Sprintf("no MetaDataOpenStack for %s",
 				anStatus.Key())
-			msrv.Log.Tracef(errorLine)
+			msrv.Log.Trace(errorLine)
 			http.Error(w, errorLine, http.StatusNotFound)
 			return
 		}
@@ -273,7 +285,7 @@ func (msrv *Msrv) handleLocationInfo() func(http.ResponseWriter, *http.Request) 
 		resp, err := json.Marshal(locInfo)
 		if err != nil {
 			msg := fmt.Sprintf("Failed to marshal location info: %v", err)
-			msrv.Log.Errorf(msg)
+			msrv.Log.Error(msg)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
@@ -307,7 +319,7 @@ func (msrv *Msrv) handleWWANStatus() func(http.ResponseWriter, *http.Request) {
 		resp, err := json.Marshal(status)
 		if err != nil {
 			msg := fmt.Sprintf("Failed to marshal WWAN status: %v", err)
-			msrv.Log.Errorf(msg)
+			msrv.Log.Error(msg)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
@@ -317,7 +329,7 @@ func (msrv *Msrv) handleWWANStatus() func(http.ResponseWriter, *http.Request) {
 	}
 }
 
-func (msrv *Msrv) handleWWANMeterics() func(http.ResponseWriter, *http.Request) {
+func (msrv *Msrv) handleWWANMetrics() func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		msrv.Log.Tracef("wwanMetricsHandler.ServeHTTP")
 		metricsObj, err := msrv.subWwanMetrics.Get("global")
@@ -329,7 +341,7 @@ func (msrv *Msrv) handleWWANMeterics() func(http.ResponseWriter, *http.Request) 
 		resp, err := json.Marshal(metrics)
 		if err != nil {
 			msg := fmt.Sprintf("Failed to marshal WWAN metrics: %v", err)
-			msrv.Log.Errorf(msg)
+			msrv.Log.Error(msg)
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			return
 		}
@@ -339,7 +351,7 @@ func (msrv *Msrv) handleWWANMeterics() func(http.ResponseWriter, *http.Request) 
 	}
 }
 
-func (msrv *Msrv) handleSigner(zedcloudCtx *zedcloud.ZedCloudContext) func(http.ResponseWriter, *http.Request) {
+func (msrv *Msrv) handleSigner(ctrlClient *controllerconn.Client) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		msrv.Log.Tracef("signerHandler.ServeHTTP")
 
@@ -353,7 +365,7 @@ func (msrv *Msrv) handleSigner(zedcloudCtx *zedcloud.ZedCloudContext) func(http.
 		payload, err := io.ReadAll(io.LimitReader(r.Body, SignerMaxSize+1))
 		if err != nil {
 			msg := fmt.Sprintf("signerHandler: ReadAll failed: %v", err)
-			msrv.Log.Errorf(msg)
+			msrv.Log.Error(msg)
 			http.Error(w, msg, http.StatusInternalServerError)
 			return
 		}
@@ -361,7 +373,7 @@ func (msrv *Msrv) handleSigner(zedcloudCtx *zedcloud.ZedCloudContext) func(http.
 		if binary.Size(payload) > SignerMaxSize {
 			msg := fmt.Sprintf("signerHandler: size exceeds limit. Expected <= %v",
 				SignerMaxSize)
-			msrv.Log.Errorf(msg)
+			msrv.Log.Error(msg)
 			http.Error(w, msg, http.StatusBadRequest)
 			return
 		}
@@ -370,16 +382,15 @@ func (msrv *Msrv) handleSigner(zedcloudCtx *zedcloud.ZedCloudContext) func(http.
 		if anStatus == nil {
 			msg := fmt.Sprintf("signerHandler: no AppNetworkStatus for %s",
 				remoteIP.String())
-			msrv.Log.Errorf(msg)
+			msrv.Log.Error(msg)
 			http.Error(w, msg, http.StatusForbidden)
 			return
 		}
 
-		resp, err := zedcloud.AddAuthentication(zedcloudCtx,
-			bytes.NewBuffer(payload), false)
+		resp, err := ctrlClient.AddAuthentication(bytes.NewBuffer(payload), false)
 		if err != nil {
 			msg := fmt.Sprintf("Failed to AddAuthentication: %v", err)
-			msrv.Log.Errorf(msg)
+			msrv.Log.Error(msg)
 			http.Error(w, msg, http.StatusInternalServerError)
 			return
 		}
@@ -406,7 +417,7 @@ func (msrv *Msrv) handleDiag() func(http.ResponseWriter, *http.Request) {
 		if anStatus == nil {
 			msg := fmt.Sprintf("diagHandler: no AppNetworkStatus for %s",
 				remoteIP.String())
-			msrv.Log.Errorf(msg)
+			msrv.Log.Error(msg)
 			http.Error(w, msg, http.StatusForbidden)
 			return
 		}
@@ -422,7 +433,7 @@ func (msrv *Msrv) handleDiag() func(http.ResponseWriter, *http.Request) {
 			DiagMaxSize+1)
 		if err != nil {
 			msg := fmt.Sprintf("diagHandler: read: %v", err)
-			msrv.Log.Errorf(msg)
+			msrv.Log.Error(msg)
 			http.Error(w, msg, http.StatusInternalServerError)
 			return
 		}
@@ -430,7 +441,7 @@ func (msrv *Msrv) handleDiag() func(http.ResponseWriter, *http.Request) {
 		if len(b) > DiagMaxSize {
 			msg := fmt.Sprintf("diagHandler: size exceeds limit. Expected <= %v",
 				DiagMaxSize)
-			msrv.Log.Errorf(msg)
+			msrv.Log.Error(msg)
 			http.Error(w, msg, http.StatusInternalServerError)
 			return
 		}
@@ -584,7 +595,26 @@ func (msrv *Msrv) handlePatchDownload() func(http.ResponseWriter, *http.Request)
 					fmt.Sprintf("failed to create temp dir %v", err))
 				return
 			}
+
+			// temp URL data populated in the cipher blobs for zip operation
+			for _, cipher := range e.CipherBlobs {
+				if cipher.EncType == types.BlobEncrytedTypeInline && cipher.Inline != nil {
+					cipher.Inline.URL, err = msrv.PopulateBinaryBlobFromCipher(&cipher, true)
+					if err != nil {
+						sendError(w, http.StatusInternalServerError,
+							fmt.Sprintf("failed to populate cipher blob %v", err))
+						return
+					}
+				}
+			}
 			zipFilename, err := utils.GetZipArchive(path, *e)
+
+			// clear the temp URL data populated in the cipher blobs
+			for _, cipher := range e.CipherBlobs {
+				if cipher.EncType == types.BlobEncrytedTypeInline && cipher.Inline != nil {
+					cipher.Inline.URL = ""
+				}
+			}
 
 			if err != nil {
 				sendError(w, http.StatusInternalServerError,
@@ -633,6 +663,15 @@ func (msrv *Msrv) handlePatchFileDownload() func(http.ResponseWriter, *http.Requ
 				http.ServeFile(w, r, e.BinaryBlobs[idx].URL)
 				msrv.increasePatchEnvelopeDownloadCounter(appUUID, *e)
 				return
+			} else if idx := types.CompletedCipherBlobIdxByName(e.CipherBlobs, fileName); idx != -1 {
+				base64Data, err := msrv.PopulateBinaryBlobFromCipher(&e.CipherBlobs[idx], true)
+				if err != nil {
+					sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to populate cipher blob %v", err))
+					return
+				}
+				serveBase64Data(w, r, base64Data)
+				msrv.increasePatchEnvelopeDownloadCounter(appUUID, *e)
+				return
 			} else {
 				sendError(w, http.StatusNotFound, "file is not found")
 				return
@@ -641,6 +680,18 @@ func (msrv *Msrv) handlePatchFileDownload() func(http.ResponseWriter, *http.Requ
 
 		sendError(w, http.StatusNotFound, "patch is not found")
 	}
+}
+
+// Handler to serve the base64 data
+func serveBase64Data(w http.ResponseWriter, r *http.Request, base64Data string) {
+	// Set the appropriate headers
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Content-Disposition", "attachment; filename=\"data.txt\"")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(base64Data)))
+
+	// Write the base64 data to the response
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(base64Data))
 }
 
 // handleAppInstanceDiscovery returns all IP addresses of each port
@@ -676,38 +727,6 @@ func (msrv *Msrv) handleAppInstanceDiscovery() func(http.ResponseWriter, *http.R
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write(marshalled)
-	}
-}
-
-// withPatchEnvelopesByIP is a middleware for Patch Envelopes which adds
-// to a context patchEnvelope variable containing available patch envelopes
-// for given IP address (it gets resolved to app instance UUID)
-// in case there is no patch envelopes available it returns StatusNoContent
-func (msrv *Msrv) withPatchEnvelopesByIP() func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			remoteIP := net.ParseIP(strings.Split(r.RemoteAddr, ":")[0])
-			anStatus := msrv.lookupAppNetworkStatusByAppIP(remoteIP)
-			if anStatus == nil {
-				w.WriteHeader(http.StatusNoContent)
-				msrv.Log.Errorf("No AppNetworkStatus for %s",
-					remoteIP.String())
-				return
-			}
-
-			appUUID := anStatus.UUIDandVersion.UUID
-
-			accessablePe := msrv.PatchEnvelopes.Get(appUUID.String())
-			if len(accessablePe.Envelopes) == 0 {
-				sendError(w, http.StatusNotFound, fmt.Sprintf("No envelopes for %s", appUUID.String()))
-			}
-
-			ctx := context.WithValue(r.Context(), patchEnvelopesContextKey, accessablePe)
-			ctx = context.WithValue(ctx, appUUIDContextKey, appUUID.String())
-
-			r = r.WithContext(ctx)
-			next.ServeHTTP(w, r)
-		})
 	}
 }
 
@@ -785,5 +804,92 @@ func (msrv *Msrv) handleActivateCredentialPost() func(http.ResponseWriter, *http
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write(out)
+	}
+}
+
+// handleNetworkStatusMetrics handles GET requests for network status and
+// metrics, returning a JSON output with the information of all device used
+// ports: interface name, status (up or down) and network metrics
+func (msrv *Msrv) handleNetworkStatusMetrics() func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		msrv.Log.Tracef("networkStatusMetricsHandler.ServeHTTP")
+
+		// Fetch network status data
+		devNetStatusObj, err := msrv.subDeviceNetworkStatus.Get("global")
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusNoContent), http.StatusNoContent)
+			return
+		}
+		devNetStatus := devNetStatusObj.(types.DeviceNetworkStatus)
+
+		// Fetch network metrics data
+		metricsObj, err := msrv.subNetworkMetrics.Get("global")
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusNoContent), http.StatusNoContent)
+			return
+		}
+		metrics := metricsObj.(types.NetworkMetrics)
+
+		// List all (used) device ports
+		devList := make([]networkStatusMetrics, 0)
+		for _, p := range devNetStatus.Ports {
+			var metric *types.NetworkMetric
+			if p.IfName == "" {
+				continue
+			}
+			for _, m := range metrics.MetricList {
+				if p.IfName == m.IfName {
+					metric = &m
+					break
+				}
+			}
+			if metric == nil {
+				continue
+			}
+
+			ifDev := &networkStatusMetrics{
+				IfName:              p.IfName,
+				Up:                  p.Up,
+				TxPkts:              metric.TxPkts,
+				RxPkts:              metric.RxPkts,
+				TxBytes:             metric.TxBytes,
+				RxBytes:             metric.RxBytes,
+				TxDrops:             metric.TxDrops,
+				RxDrops:             metric.RxDrops,
+				TxErrors:            metric.TxErrors,
+				RxErrors:            metric.RxErrors,
+				TxACLDrops:          metric.TxAclDrops,
+				RxACLDrops:          metric.RxAclDrops,
+				TxACLRateLimitDrops: metric.TxAclRateLimitDrops,
+				RxACLRateLimitDrops: metric.RxAclRateLimitDrops,
+			}
+			devList = append(devList, *ifDev)
+		}
+
+		// Create output JSON from devList
+		resp, err := json.Marshal(devList)
+		if err != nil {
+			msg := fmt.Sprintf("Failed to marshal network status and metrics: %v", err)
+			msrv.Log.Error(msg)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Add("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(resp)
+	}
+}
+
+// reverseProxy is a handler which proxies request to target URL
+func (msrv *Msrv) reverseProxy(target *url.URL) func(http.ResponseWriter, *http.Request) {
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ErrorHandler = func(rw http.ResponseWriter, r *http.Request, err error) {
+		msrv.Log.Errorf("httputil proxy error: %v", err)
+		rw.WriteHeader(http.StatusBadGateway)
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Host = target.Host
+		proxy.ServeHTTP(w, r)
 	}
 }

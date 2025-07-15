@@ -372,13 +372,15 @@ func PublishDeviceInfoToZedCloud(ctx *zedagentContext, dest destinationBitset) {
 		swInfo.ShortVersion = bos.BaseOsVersion
 		swInfo.LongVersion = "" // XXX
 		ctInterface, _ := ctx.getconfigCtx.subContentTreeStatus.Get(bos.ContentTreeUUID)
-		if ctInterface != nil {
-			ct, ok := ctInterface.(types.ContentTreeStatus)
-			if ok {
-				// Assume one - pick first ContentTreeStatus
-				swInfo.DownloadProgress = uint32(ct.Progress)
-			}
+		if ctInterface == nil {
+			continue
 		}
+		ct, ok := ctInterface.(types.ContentTreeStatus)
+		if !ok {
+			continue
+		}
+		// Assume one - pick first ContentTreeStatus
+		swInfo.DownloadProgress = uint32(ct.Progress)
 		if !bos.ErrorTime.IsZero() {
 			log.Tracef("reportMetrics sending error time %v error %v for %s",
 				bos.ErrorTime, bos.Error, bos.BaseOsVersion)
@@ -408,6 +410,7 @@ func PublishDeviceInfoToZedCloud(ctx *zedagentContext, dest destinationBitset) {
 			for _, disk := range zfsPoolStatus.Disks {
 				diskInfo := new(info.StorageDiskState)
 				diskInfo.Status = info.StorageStatus(disk.Status)
+				diskInfo.SmartStatus = hardware.CheckSMARTinfoForDisk(disk.DiskName.Name)
 				diskInfo.State = disk.AuxStateStr
 				if disk.DiskName != nil {
 					diskInfo.DiskName = new(evecommon.DiskDescription)
@@ -441,6 +444,7 @@ func PublishDeviceInfoToZedCloud(ctx *zedagentContext, dest destinationBitset) {
 			rDiskStatus.DiskName.Name = *proto.String(mi.Source)
 			rDiskStatus.DiskName.Serial = *proto.String(serialNumber)
 			rDiskStatus.Status = info.StorageStatus_STORAGE_STATUS_ONLINE
+			rDiskStatus.SmartStatus = hardware.CheckSMARTinfoForDisk(rDiskStatus.DiskName.Name)
 			xStorageInfo.Disks = append(xStorageInfo.Disks, rDiskStatus)
 		}
 		ReportDeviceInfo.StorageInfo = append(ReportDeviceInfo.StorageInfo, xStorageInfo)
@@ -648,7 +652,7 @@ func PublishDeviceInfoToZedCloud(ctx *zedagentContext, dest destinationBitset) {
 	// device returns a runtime error. Similarly, we only support enforced application network
 	// interface order for the KVM hypervisor. If enabled for application deployed under Xen
 	// or Kubevirt hypervisor, EVE returns error and the application will not be started.
-	ReportDeviceInfo.ApiCapability = info.APICapability_API_CAPABILITY_NTPS_FQDN
+	ReportDeviceInfo.ApiCapability = info.APICapability_API_CAPABILITY_DISABLE_VTPM
 
 	// Report if there is a local override of profile
 	if ctx.getconfigCtx.sideController.currentProfile !=
@@ -697,13 +701,12 @@ func PublishDeviceInfoToZedCloud(ctx *zedagentContext, dest destinationBitset) {
 	if buf == nil {
 		log.Fatal("malloc error")
 	}
-	size := int64(proto.Size(ReportInfo))
 
 	//We queue the message and then get the highest priority message to send.
 	//If there are no failures and defers we'll send this message,
 	//but if there is a queue we'll retry sending the highest priority message.
 	withNetTracing := traceNextInfoReq(ctx)
-	queueInfoToDest(ctx, dest, deviceUUID, buf, size, true, withNetTracing, false,
+	queueInfoToDest(ctx, dest, deviceUUID, buf, true, withNetTracing, false,
 		info.ZInfoTypes_ZiDevice)
 }
 
@@ -750,12 +753,11 @@ func PublishAppInstMetaDataToZedCloud(ctx *zedagentContext,
 	if buf == nil {
 		log.Fatal("malloc error")
 	}
-	size := int64(proto.Size(ReportInfo))
 
 	//We queue the message and then get the highest priority message to send.
 	//If there are no failures and defers we'll send this message,
 	//but if there is a queue we'll retry sending the highest priority message.
-	queueInfoToDest(ctx, dest, deferKey, buf, size, true, false, false,
+	queueInfoToDest(ctx, dest, deferKey, buf, true, false, false,
 		info.ZInfoTypes_ZiAppInstMetaData)
 }
 
@@ -981,6 +983,69 @@ func encodeCellProviders(wwanStatus types.WwanNetworkStatus) (providers []*info.
 	return providers
 }
 
+func encodeCellIPType(ipType types.WwanIPType) evecommon.CellularIPType {
+	switch ipType {
+	case types.WwanIPTypeUnspecified:
+		return evecommon.CellularIPType_CELLULAR_IP_TYPE_UNSPECIFIED
+	case types.WwanIPTypeIPv4:
+		return evecommon.CellularIPType_CELLULAR_IP_TYPE_IPV4
+	case types.WwanIPTypeIPv4AndIPv6:
+		return evecommon.CellularIPType_CELLULAR_IP_TYPE_IPV4_AND_IPV6
+	case types.WwanIPTypeIPv6:
+		return evecommon.CellularIPType_CELLULAR_IP_TYPE_IPV6
+	default:
+		log.Errorf("Invalid wwan IP type: %v", ipType)
+	}
+	return evecommon.CellularIPType_CELLULAR_IP_TYPE_UNSPECIFIED
+}
+
+func encodeCellBearerType(bearerType types.BearerType) evecommon.BearerType {
+	switch bearerType {
+	case types.BearerTypeUnspecified:
+		return evecommon.BearerType_BEARER_TYPE_UNSPECIFIED
+	case types.BearerTypeAttach:
+		return evecommon.BearerType_BEARER_TYPE_ATTACH
+	case types.BearerTypeDefault:
+		return evecommon.BearerType_BEARER_TYPE_DEFAULT
+	case types.BearerTypeDedicated:
+		return evecommon.BearerType_BEARER_TYPE_DEDICATED
+	default:
+		log.Errorf("Invalid wwan bearer type: %v", bearerType)
+	}
+	return evecommon.BearerType_BEARER_TYPE_UNSPECIFIED
+}
+
+func encodeCellBearers(wwanStatus types.WwanNetworkStatus) (bearers []*info.CellularBearer) {
+	for _, bearer := range wwanStatus.Bearers {
+		var connectedAt *timestamppb.Timestamp
+		if bearer.ConnectedAt != 0 {
+			connectedAt = timestamppb.New(time.Unix(int64(bearer.ConnectedAt), 0))
+		}
+		bearers = append(bearers, &info.CellularBearer{
+			Apn:             bearer.APN,
+			BearerType:      encodeCellBearerType(bearer.Type),
+			IpType:          encodeCellIPType(bearer.IPType),
+			Connected:       bearer.Connected,
+			ConnectionError: bearer.ConnectionError,
+			ConnectedAt:     connectedAt,
+		})
+	}
+	return bearers
+}
+
+func encodeCellProfiles(wwanStatus types.WwanNetworkStatus) (profiles []*info.CellularProfile) {
+	for _, profile := range wwanStatus.Profiles {
+		profiles = append(profiles, &info.CellularProfile{
+			ProfileName:   profile.Name,
+			Apn:           profile.APN,
+			BearerType:    encodeCellBearerType(profile.BearerType),
+			IpType:        encodeCellIPType(profile.IPType),
+			ForbidRoaming: profile.ForbidRoaming,
+		})
+	}
+	return profiles
+}
+
 func encodeSystemAdapterInfo(ctx *zedagentContext) *info.SystemAdapterInfo {
 	dpcl := *ctx.DevicePortConfigList
 	sainfo := new(info.SystemAdapterInfo)
@@ -1001,10 +1066,6 @@ func encodeSystemAdapterInfo(ctx *zedagentContext) *info.SystemAdapterInfo {
 
 		dps.Ports = make([]*info.DevicePort, len(dpc.Ports))
 		for j, p := range dpc.Ports {
-			if !p.IsL3Port {
-				// info for ports from lower layers is not published
-				continue
-			}
 			if i == dpcl.CurrentIndex {
 				// For the currently used DPC we publish the status (DeviceNetworkStatus).
 				portStatus := deviceNetworkStatus.LookupPortByLogicallabel(p.Logicallabel)
@@ -1129,6 +1190,8 @@ func encodeNetworkPortStatus(ctx *zedagentContext,
 				ConnectedAt:    connectedAt,
 				ConfigError:    wwanStatus.ConfigError,
 				ProbeError:     wwanStatus.ProbeError,
+				Bearers:        encodeCellBearers(wwanStatus),
+				Profiles:       encodeCellProfiles(wwanStatus),
 			},
 		}
 	case types.WirelessTypeWifi:

@@ -48,12 +48,12 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/cmd/zedmanager"
 	"github.com/lf-edge/eve/pkg/pillar/cmd/zedrouter"
 	"github.com/lf-edge/eve/pkg/pillar/cmd/zfsmanager"
+	"github.com/lf-edge/eve/pkg/pillar/controllerconn"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub/reverse"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub/socketdriver"
 	_ "github.com/lf-edge/eve/pkg/pillar/rstats"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	"github.com/sirupsen/logrus"
 )
 
@@ -138,7 +138,7 @@ func main() {
 	if basename == agentName {
 		sep := entrypoint{f: runZedbox, inline: inlineAlways}
 		inline := true
-		err := zedcloud.InitializeCertDir(log)
+		err := controllerconn.InitializeCertDir(log)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -172,7 +172,7 @@ func runService(serviceName string, sep entrypoint, inline bool) int {
 		// or fatal. Don't hide that as the reboot reason.
 		// If that is not the case, then watchdog will soon detect that this service
 		// is not running.
-		log.Errorf(err.Error())
+		log.Error(err.Error())
 		return 1
 	}
 	return 0
@@ -200,7 +200,7 @@ func runZedbox(ps *pubsub.PubSub, logger *logrus.Logger, log *base.LogObject, ar
 			if err := json.Unmarshal([]byte(subData), &serviceInitStatus); err != nil {
 				err := fmt.Errorf("zedbox: exception while unmarshalling data %s. %s",
 					subData, err.Error())
-				log.Errorf(err.Error())
+				log.Error(err.Error())
 				break
 			}
 			// Kick off the command in a goroutine

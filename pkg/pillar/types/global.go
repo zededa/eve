@@ -4,6 +4,7 @@
 package types
 
 import (
+	"encoding/base64"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -158,6 +159,8 @@ const (
 	CertInterval GlobalSettingKey = "timer.cert.interval"
 	// MetricInterval global setting key
 	MetricInterval GlobalSettingKey = "timer.metric.interval"
+	// HardwareHealthInterval global setting key
+	HardwareHealthInterval GlobalSettingKey = "timer.hardwarehealth.interval"
 	// DiskScanMetricInterval global setting key
 	DiskScanMetricInterval GlobalSettingKey = "timer.metric.diskscan.interval"
 	// ResetIfCloudGoneTime global setting key
@@ -260,6 +263,18 @@ const (
 	EnableARPSnoop GlobalSettingKey = "network.switch.enable.arpsnoop"
 	// WwanQueryVisibleProviders : periodically query visible cellular service providers
 	WwanQueryVisibleProviders GlobalSettingKey = "wwan.query.visible.providers"
+	// WwanModemRecoveryWatchdog : trigger watchdog when cellular modem crashes and fails to recover.
+	WwanModemRecoveryWatchdog GlobalSettingKey = "wwan.modem.recovery.watchdog"
+	// WwanModemRecoveryReloadDrivers : reload QMI/MBIM/MHI drivers when cellular modem crashes
+	// and fails to recover. This occurs before the watchdog mechanism is triggered (if enabled
+	// by WwanModemRecoveryWatchdog).
+	WwanModemRecoveryReloadDrivers GlobalSettingKey = "wwan.modem.recovery.reload.drivers"
+	// WwanModemRecoveryRestartModemManager : If a modem firmware crash occurs and ModemManager
+	// fails to properly recognize or manage the restarted modem, EVE will attempt to restart
+	// ModemManager as a recovery step. This occurs before the watchdog mechanism is triggered
+	// (if enabled by WwanModemRecoveryWatchdog) and can be combined with driver reload recovery
+	// mechanism (see WwanModemRecoveryReloadDrivers).
+	WwanModemRecoveryRestartModemManager GlobalSettingKey = "wwan.modem.recovery.restart.modemmanager"
 
 	// GoroutineLeakDetectionThreshold amount of goroutines, reaching which will trigger leak detection
 	// regardless of growth rate.
@@ -283,6 +298,9 @@ const (
 
 	// MaintenanceMode global setting key
 	MaintenanceMode GlobalSettingKey = "maintenance.mode"
+	// AirGapMode should be enabled when device is operated in an air-gapped network environment,
+	// where connectivity to the main controller is not available.
+	AirGapMode GlobalSettingKey = "airgap.mode"
 
 	// String Items
 	// SSHAuthorizedKeys global setting key
@@ -305,6 +323,20 @@ const (
 	KernelRemoteLogLevel GlobalSettingKey = "debug.kernel.remote.loglevel"
 	// FmlCustomResolution global setting key
 	FmlCustomResolution GlobalSettingKey = "app.fml.resolution"
+	// EdgeviewPublicKeys global setting key
+	EdgeviewPublicKeys GlobalSettingKey = "edgeview.authen.publickey"
+
+	// Log filtering and dedupliction
+	// LogDedupWindowSize is a measure of how many log entries are saved to search for duplicates
+	LogDedupWindowSize GlobalSettingKey = "log.dedup.window.size"
+	// LogFilenamesToCount a comma-separated list of log filenames to count
+	LogFilenamesToCount GlobalSettingKey = "log.count.filenames"
+	// LogFilenamesToFilter a comma-separated list of log filenames to filter
+	LogFilenamesToFilter GlobalSettingKey = "log.filter.filenames"
+	// VectorEnabled is a global setting key to enable Vector
+	VectorEnabled GlobalSettingKey = "vector.enabled"
+	// VectorConfig is a full base64-encoded configuration for Vector in yaml format.
+	VectorConfig GlobalSettingKey = "vector.config"
 
 	// DisableDHCPAllOnesNetMask option is deprecated and has no effect.
 	// Zedrouter no longer uses the all-ones netmask as it adds unnecessary complexity,
@@ -361,6 +393,16 @@ const (
 
 	// MemoryMonitorEnabled : Enable memory monitor
 	MemoryMonitorEnabled GlobalSettingKey = "memory-monitor.enabled"
+
+	// TUIMonitorLogLevel: log level for TUI monitor
+	TUIMonitorLogLevel GlobalSettingKey = "debug.tui.loglevel"
+
+	// MsrvPrometheusMetricsRequestPerSecond: limit the number of requests per second
+	MsrvPrometheusMetricsRequestPerSecond GlobalSettingKey = "msrv.prometheus.metrics.rps"
+	// MsrvPrometheusMetricsBurst: limit the burst of requests
+	MsrvPrometheusMetricsBurst GlobalSettingKey = "msrv.prometheus.metrics.burst"
+	// MsrvPrometheusMetricsIdleTimeoutSeconds: idle timeout for the connection
+	MsrvPrometheusMetricsIdleTimeoutSeconds GlobalSettingKey = "msrv.prometheus.metrics.idletimeout.seconds"
 )
 
 // AgentSettingKey - keys for per-agent settings
@@ -921,11 +963,14 @@ func NewConfigItemSpecMap() ConfigItemSpecMap {
 	// timer.metric.diskscan.interval (seconds)
 	// Shorter interval can lead to device scanning the disk frequently which is a costly operation.
 	configItemSpecMap.AddIntItem(DiskScanMetricInterval, 300, 5, HourInSec)
-	// timer.metric.diskscan.interval (seconds)
+	// timer.metric.interval (seconds)
 	// Need to be careful about max value. Controller may use metric message to
 	// update status of device (online / suspect etc ).
 	configItemSpecMap.AddIntItem(MetricInterval, 60, 5, HourInSec)
-	// timer.reboot.no.network (seconds) - reboot after no cloud connectivity
+	// timer.metric.hardwarehealth.interval (seconds)
+	// Default value 12 hours minimum value 6 hours.
+	configItemSpecMap.AddIntItem(HardwareHealthInterval, 43200, 21600, 0xFFFFFFFF)
+	// timer.reboot.no.network (seconds) - reboot after no controller connectivity
 	// Max designed to allow the option of never rebooting even if device
 	//  can't connect to the cloud
 	configItemSpecMap.AddIntItem(ResetIfCloudGoneTime, 7*24*3600, 120, 0xFFFFFFFF)
@@ -988,8 +1033,8 @@ func NewConfigItemSpecMap() ConfigItemSpecMap {
 	configItemSpecMap.AddIntItem(GoroutineLeakDetectionCooldownMinutes, 5, 1, 0xFFFFFFFF)
 
 	// Kubevirt Drain Section
-	configItemSpecMap.AddIntItem(KubevirtDrainTimeout, 24, 1, 0xFFFFFFFF)
-	configItemSpecMap.AddIntItem(KubevirtDrainSkipK8sAPINotReachableTimeout, 300, 1, 0xFFFFFFFF)
+	configItemSpecMap.AddIntItem(KubevirtDrainTimeout, DefaultDrainTimeoutHours, 1, 0xFFFFFFFF)
+	configItemSpecMap.AddIntItem(KubevirtDrainSkipK8sAPINotReachableTimeout, DefaultDrainSkipK8sAPINotReachableTimeoutSeconds, 1, 0xFFFFFFFF)
 
 	// Add Bool Items
 	configItemSpecMap.AddBoolItem(UsbAccess, true) // Controller likely default to false
@@ -1004,12 +1049,16 @@ func NewConfigItemSpecMap() ConfigItemSpecMap {
 	configItemSpecMap.AddBoolItem(VncShimVMAccess, false)
 	configItemSpecMap.AddBoolItem(EnableARPSnoop, true)
 	configItemSpecMap.AddBoolItem(WwanQueryVisibleProviders, false)
+	configItemSpecMap.AddBoolItem(WwanModemRecoveryWatchdog, false)
+	configItemSpecMap.AddBoolItem(WwanModemRecoveryReloadDrivers, false)
+	configItemSpecMap.AddBoolItem(WwanModemRecoveryRestartModemManager, false)
 	configItemSpecMap.AddBoolItem(NetworkLocalLegacyMACAddress, false)
 	configItemSpecMap.AddBoolItem(MemoryMonitorEnabled, false)
 
 	// Add TriState Items
 	configItemSpecMap.AddTriStateItem(NetworkFallbackAnyEth, TS_DISABLED)
 	configItemSpecMap.AddTriStateItem(MaintenanceMode, TS_NONE)
+	configItemSpecMap.AddTriStateItem(AirGapMode, TS_NONE)
 
 	// Add String Items
 	configItemSpecMap.AddStringItem(SSHAuthorizedKeys, "", blankValidator)
@@ -1020,6 +1069,17 @@ func NewConfigItemSpecMap() ConfigItemSpecMap {
 	configItemSpecMap.AddStringItem(SyslogRemoteLogLevel, "info", validateSyslogKernelLevel)
 	configItemSpecMap.AddStringItem(KernelRemoteLogLevel, "info", validateSyslogKernelLevel)
 	configItemSpecMap.AddStringItem(FmlCustomResolution, FmlResolutionUnset, blankValidator)
+	configItemSpecMap.AddStringItem(TUIMonitorLogLevel, "info", blankValidator)
+	configItemSpecMap.AddStringItem(EdgeviewPublicKeys, "", blankValidator)
+
+	// Log deduplication and filtering settings
+	configItemSpecMap.AddIntItem(LogDedupWindowSize, 0, 0, 0xFFFFFFFF)
+	configItemSpecMap.AddStringItem(LogFilenamesToCount, "", blankValidator)
+	configItemSpecMap.AddStringItem(LogFilenamesToFilter, "", blankValidator)
+
+	// Vector
+	configItemSpecMap.AddBoolItem(VectorEnabled, true)
+	configItemSpecMap.AddStringItem(VectorConfig, "", base64Validator)
 
 	// Add Agent Settings
 	configItemSpecMap.AddAgentSettingStringItem(LogLevel, "info", validateLogLevel)
@@ -1032,6 +1092,11 @@ func NewConfigItemSpecMap() ConfigItemSpecMap {
 	configItemSpecMap.AddIntItem(NetDumpTopicMaxCount, 10, 1, 0xFFFFFFFF)
 	configItemSpecMap.AddBoolItem(NetDumpDownloaderPCAP, false)
 	configItemSpecMap.AddBoolItem(NetDumpDownloaderHTTPWithFieldValue, false)
+
+	// Add Metadata Server Prometheus metrics limits settings
+	configItemSpecMap.AddIntItem(MsrvPrometheusMetricsRequestPerSecond, 1, 1, 0xFFFFFFFF)
+	configItemSpecMap.AddIntItem(MsrvPrometheusMetricsBurst, 10, 1, 0xFFFFFFFF)
+	configItemSpecMap.AddIntItem(MsrvPrometheusMetricsIdleTimeoutSeconds, 4*60, 1, 0xFFFFFFFF)
 
 	return configItemSpecMap
 }
@@ -1059,6 +1124,14 @@ func validateSyslogKernelLevel(level string) error {
 
 // blankValidator - A validator that accepts any string
 func blankValidator(s string) error {
+	return nil
+}
+
+func base64Validator(s string) error {
+	_, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return fmt.Errorf("base64Validator: %s is not a valid base64 string: %w", s, err)
+	}
 	return nil
 }
 

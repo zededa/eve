@@ -1,18 +1,24 @@
-# EVE meta-data server for app instances
+# EVE metadata server for app instances
 
-EVE provides an old method to serve cloud-init meta-data in the form of a read-only CDROM disk which is created on the fly when an app instance is booted if the API specifies userData/cipherData in the [AppInstanceConfig message](https://github.com/lf-edge/eve-api/tree/main/proto/config/appconfig.proto).
+EVE provides an old method to serve cloud-init metadata in the form of a read-only CDROM disk which is created on the fly when an app instance is booted if the API specifies userData/cipherData in the [AppInstanceConfig message](https://github.com/lf-edge/eve-api/tree/main/proto/config/appconfig.proto).
 
-However, there is also a need to provide access to meta-data which might change while the app instance is running.
+However, there is also a need to provide access to metadata which might change while the app instance is running.
 
 The first data which is needed by applications is determining the external IP address of the edge node, so that when there is a portmap ACL in place the application instance can determine which IP plus port its peers should use to connect to it.
 
-The initial meta-data service provides merely that, but over time we expect to add the rest of the cloud-init content.
+The initial metadata service provides merely that, but over time we expect to add the rest of the cloud-init content.
+
+## Access Limitation
+
+The metadata server endpoints (e.g. <http://169.254.169.254/eve/v1/network.json> and <http://169.254.169.254/eve/v1/external_ipv4>) are only accessible over a **local network instance** (the built-in host-NAT network). These endpoints are **not** available if the app or VM is running on a "switch network" or an "app-direct" network.
+
+*See "Networking Modes" in the main EVE architecture guide for more details on local vs. switch/app-direct network.*
 
 ## Schema
 
 There is no existing industry standard schema specifying a notion of an external IP; existing schemas contain public and private IP addresses but the external IP is a different thing necessitated by the internal NAT which EVE deploys for the local network instances.
 
-Thus this particular part of the meta-data uses a EVE-unique schema, which we do not expect for other meta-data information.
+Thus this particular part of the metadata uses an EVE-unique schema, which we do not expect for other meta-data information.
 
 The API endpoint is <http://169.254.169.254/eve/v1/network.json>
 
@@ -29,7 +35,7 @@ The returned json contains
 - enterprise-id: a string with the id of the enterprise the device is associated with
 - enterprise-name: a string with the name of the enterprise the device is associated with
 
-Note that there is no need to specify the application instance identity since the meta-data server in EVE determines that from the virtual network adapter the application instance is using to communicate with EVE.
+Note that there is no need to specify the application instance identity since the metadata server in EVE determines that from the virtual network adapter the application instance is using to communicate with EVE.
 
 ## Example usage
 
@@ -54,7 +60,7 @@ curl <http://169.254.169.254/eve/v1/external_ipv4>
 
 ## Location API endpoint
 
-Meta-data service allows applications to obtain geographic coordinates of the device,
+Metadata service allows applications to obtain geographic coordinates of the device,
 determined using Global Navigation Satellite Systems. This is available only if device
 has a supported LTE modem with an integrated GNSS receiver (e.g. Sierra Wireless EM7565).
 Standalone GPS receivers are currently not supported.
@@ -122,7 +128,7 @@ coordinates presented to applications are never older than 20 seconds.
 
 ## Cellular connectivity metadata
 
-Using meta-data server, applications are able to request information about the current state
+Using metadata server, applications are able to request information about the current state
 of the cellular connectivity of the device. This covers all wireless wide area networks (WWANs)
 configured for the device, with information about the installed cellular equipment (modem(s)
 and SIM card(s)), identity information (IMEI, IMSI, ICCID), available network providers (PLMNs),
@@ -299,6 +305,64 @@ All measurements are of type `int32`. Measured values are rounded to the nearest
 (by the modem) and published without decimal places. The maximum value of `int32` (`0x7FFFFFFF`)
 represents unspecified/unavailable metric.
 
+### Network Status and Metrics endpoint
+
+Applications might require to fetch data about the status and metrics of
+network interfaces from the Edge Node. The endpoint `eve/v1/networks/metrics.json`
+provides relevant information about all (used) device ports, which includes
+physical (e.g. ethernet, WiFi, modems) and virtual interfaces created on
+top of the physical ones - VLANs and LAGs. Virtual interfaces used for
+applications connectivity (bridges, TAPs, etc.) are not included.
+
+Example of usage:
+
+```shell
+curl -s http://169.254.169.254/eve/v1/networks/metrics.json | jq
+```
+
+```json
+[
+  {
+    "IfName": "eth0",
+    "Up": true,
+    "TxBytes": 3640643,
+    "RxBytes": 15997359,
+    "TxDrops": 0,
+    "RxDrops": 0,
+    "TxPkts": 17745,
+    "RxPkts": 25705,
+    "TxErrors": 0,
+    "RxErrors": 0,
+    "TxACLDrops": 0,
+    "RxACLDrops": 0,
+    "TxACLRateLimitDrops": 0,
+    "RxACLRateLimitDrops": 0
+  },
+  {
+    "IfName": "eth1",
+    "Up": true,
+    "TxBytes": 2754016,
+    "RxBytes": 1520664,
+    "TxDrops": 0,
+    "RxDrops": 0,
+    "TxPkts": 7815,
+    "RxPkts": 7783,
+    "TxErrors": 0,
+    "RxErrors": 0,
+    "TxACLDrops": 0,
+    "RxACLDrops": 0,
+    "TxACLRateLimitDrops": 0,
+    "RxACLRateLimitDrops": 0
+  }
+]
+```
+
+Note that the metrics provided by this endpoint are collected from Linux
+counters, including for modem interfaces. However, the metrics provided by
+the `/eve/v1/wwan/metrics.json` endpoint are collected directly from
+modems. Thus, there can be differences, for instance, if the modem is
+dropping packets.
+
 ### Signer API endpoint
 
 Applications might want to get some application-specific data signed by EVE-OS so that they can verify it was indeed generated by an app instance running on a particular device.
@@ -361,3 +425,45 @@ curl -X GET http://169.254.169.254/eve/v1/patch/download/699fbdb2-e455-448f-84f5
 
 %base64-encoded file contents%
 ```
+
+### Prometheus '/metrics' endpoint
+
+The /metrics endpoint provides access to system-level metrics from the EVE host where your EdgeApp is running.
+These metrics are sourced directly from a Node Exporter instance, expected to be available on localhost:9100 within the EVE host.
+
+When a client inside the EdgeApp makes a request to '/metrics', the EdgeApp transparently forwards the request to the Node Exporter
+and returns the response. The metrics are in Prometheus exposition format, making them compatible with Prometheus scraping and monitoring tools.
+
+>About Prometheus:
+[Prometheus](https://prometheus.io/) is an open-source systems monitoring and alerting toolkit. It collects and stores metrics as time series data, allowing users to query, visualize, and create alerts based on those metrics.
+
+#### Key Details
+
+- Target: Forwards all traffic internally to localhost:9100 on the EVE host.
+- Metrics Format: Prometheus-compatible plain text format.
+- Metrics Scope: Host-level metrics (not EdgeApp-specific).
+- Availability: Exposed within the EdgeApp.
+
+#### Rate Limiting
+
+To protect the system from overload, a *rate limiter* per client IP address is enforced:
+
+- Allowed Rate: 1 request per second.
+- Burst Capacity: Up to 10 requests can be handled immediately before rate limiting applies.
+- Idle Timeout: 4 minutes (if no requests are made from an IP for 4 minutes, the rate limit state is reset).
+
+Exceeding the allowed rate may result in the request being temporarily rejected with an appropriate HTTP error code (e.g., `429 Too Many Requests`).
+
+#### Usage Example
+
+```bash
+curl -X GET http://169.254.169.254/metrics
+```
+
+This command retrieves current host system metrics.
+
+#### Notes
+
+- Ensure that the Node Exporter service is running and accessible at localhost:9100 on the EVE host for this endpoint to function correctly.
+
+- This endpoint is intended for observability and monitoring purposes. Avoid frequent polling to respect rate limits and ensure system stability.

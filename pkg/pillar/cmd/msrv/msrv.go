@@ -6,6 +6,8 @@
 // parameters and download patch envelopes.
 // You can think of metadata server as a translator from pubsub to REST API for
 // Application Instances
+//
+// Limitation: only via local-access and not accessible over switch or app-direct networks.
 
 package msrv
 
@@ -14,6 +16,7 @@ import (
 	"context"
 	"encoding/gob"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -21,13 +24,13 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/agentbase"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/cipher"
+	"github.com/lf-edge/eve/pkg/pillar/controllerconn"
 	"github.com/lf-edge/eve/pkg/pillar/flextimer"
 	"github.com/lf-edge/eve/pkg/pillar/persistcache"
 	"github.com/lf-edge/eve/pkg/pillar/pidfile"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/utils/generics"
-	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	"github.com/sirupsen/logrus"
 )
 
@@ -62,6 +65,12 @@ const DiagMaxSize = 65535
 
 // MetaDataServerIP is IP of meta data server
 const MetaDataServerIP = "169.254.169.254"
+
+// We forward /metrics endpoint to this URL
+// we assume that NodeExporter will be serving on default port 9100
+const (
+	NodeExporterMetricsURL = "http://localhost:9100"
+)
 
 // Msrv struct contains all PubSubs which are needed to compose REST APIs
 // for App Instances
@@ -105,9 +114,13 @@ type Msrv struct {
 
 	subDomainStatus pubsub.Subscription
 
+	subNetworkMetrics pubsub.Subscription
+
 	subAppNetworkStatus pubsub.Subscription
 
 	subDeviceNetworkStatus pubsub.Subscription
+
+	pubCipherMetrics pubsub.Publication
 
 	// Subscriptions to gather information about
 	// patch envelopes from volumemgr and zedagent
@@ -127,6 +140,8 @@ type Msrv struct {
 	peUsagePersist      *persistcache.PersistCache
 
 	pubPatchEnvelopesUsage pubsub.Publication
+
+	pmc *PrometheusMetricsConf
 }
 
 // Run starts up agent
@@ -154,6 +169,9 @@ func Run(ps *pubsub.PubSub, logger *logrus.Logger, log *base.LogObject, argument
 func (msrv *Msrv) Init(cachePath string, persist bool) (err error) {
 	msrv.patchEnvelopesUsage = generics.NewLockedMap[string, types.PatchEnvelopeUsage]()
 
+	// Initialize the metrics configuration
+	msrv.pmc = defaultPrometheusMetricsConf()
+
 	if err = msrv.initPublications(); err != nil {
 		return err
 	}
@@ -167,7 +185,7 @@ func (msrv *Msrv) Init(cachePath string, persist bool) (err error) {
 	msrv.decryptCipherContext.PubSubControllerCert = msrv.subControllerCert
 	msrv.decryptCipherContext.PubSubEdgeNodeCert = msrv.subEdgeNodeCert
 
-	msrv.PatchEnvelopes = NewPatchEnvelopes(msrv.Log, msrv.PubSub)
+	msrv.PatchEnvelopes = NewPatchEnvelopes(msrv)
 	msrv.patchEnvelopesUsage = generics.NewLockedMap[string, types.PatchEnvelopeUsage]()
 
 	msrv.peUsagePersist, err = persistcache.New(cachePath)
@@ -212,6 +230,17 @@ func (msrv *Msrv) initPublications() (err error) {
 		pubsub.PublicationOptions{
 			AgentName: agentName,
 			TopicType: types.PatchEnvelopeUsage{},
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	msrv.pubCipherBlockStatus, err = msrv.PubSub.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName:  agentName,
+			Persistent: true,
+			TopicType:  types.CipherBlockStatus{},
 		},
 	)
 	if err != nil {
@@ -289,6 +318,17 @@ func (msrv *Msrv) initSubscriptions(persist bool) (err error) {
 	if err != nil {
 		return err
 	}
+
+	msrv.cipherMetrics = cipher.NewAgentMetrics(agentName)
+	pubCipherMetrics, err := msrv.PubSub.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName: agentName,
+			TopicType: types.CipherMetrics{},
+		})
+	if err != nil {
+		return err
+	}
+	msrv.pubCipherMetrics = pubCipherMetrics
 
 	// Subscribe to AppNetworkConfig from zedmanager
 	msrv.subAppNetworkConfig, err = msrv.PubSub.NewSubscription(pubsub.SubscriptionOptions{
@@ -463,6 +503,19 @@ func (msrv *Msrv) initSubscriptions(persist bool) (err error) {
 		return err
 	}
 
+	// Subscribe to network metrics from zedrouter
+	msrv.subNetworkMetrics, err = msrv.PubSub.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "zedrouter",
+		MyAgentName: agentName,
+		TopicImpl:   types.NetworkMetrics{},
+		Activate:    false,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+	})
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -480,6 +533,7 @@ func (msrv *Msrv) Activate() error {
 		msrv.subWwanStatus,
 		msrv.subWwanMetrics,
 		msrv.subDomainStatus,
+		msrv.subNetworkMetrics,
 		msrv.subAppNetworkStatus,
 		msrv.subDeviceNetworkStatus,
 		msrv.subPatchEnvelopeInfo,
@@ -533,6 +587,33 @@ func (msrv *Msrv) Run(ctx context.Context) (err error) {
 		return err
 	}
 
+	// Wait for the EdgeNodeInfo, and EdgeNodeCert and ControllerCert publications
+	var edgenodeCertInitialized, controllerCertInitialized, edgenodeInfoInitialized bool
+	for !edgenodeCertInitialized || !controllerCertInitialized || !edgenodeInfoInitialized {
+		select {
+		case change := <-msrv.subEdgeNodeCert.MsgChan():
+			msrv.subEdgeNodeCert.ProcessChange(change)
+			msrv.Log.Noticef("msrv: EdgeNodeCert, len %d", len(msrv.subEdgeNodeCert.GetAll()))
+			if len(msrv.subEdgeNodeCert.GetAll()) > 0 {
+				edgenodeCertInitialized = true
+			}
+		case change := <-msrv.subControllerCert.MsgChan():
+			msrv.subControllerCert.ProcessChange(change)
+			msrv.Log.Noticef("msrv: ControllerCert, len %d", len(msrv.subEdgeNodeCert.GetAll()))
+			if len(msrv.subControllerCert.GetAll()) > 0 {
+				controllerCertInitialized = true
+			}
+		case change := <-msrv.subEdgeNodeInfo.MsgChan():
+			msrv.subEdgeNodeInfo.ProcessChange(change)
+			msrv.Log.Noticef("msrv: EdgeNodeInfo, len %d", len(msrv.subEdgeNodeInfo.GetAll()))
+			if len(msrv.subEdgeNodeInfo.GetAll()) > 0 {
+				edgenodeInfoInitialized = true
+			}
+		case <-stillRunning.C:
+		}
+		msrv.PubSub.StillRunning(agentName, warningTime, errorTime)
+	}
+
 	for {
 		select {
 
@@ -566,6 +647,9 @@ func (msrv *Msrv) Run(ctx context.Context) (err error) {
 		case change := <-msrv.subWwanMetrics.MsgChan():
 			msrv.subWwanMetrics.ProcessChange(change)
 
+		case change := <-msrv.subNetworkMetrics.MsgChan():
+			msrv.subNetworkMetrics.ProcessChange(change)
+
 		case change := <-msrv.subDomainStatus.MsgChan():
 			msrv.subDomainStatus.ProcessChange(change)
 
@@ -583,6 +667,9 @@ func (msrv *Msrv) Run(ctx context.Context) (err error) {
 
 		case change := <-msrv.subContentTreeStatus.MsgChan():
 			msrv.subContentTreeStatus.ProcessChange(change)
+
+		case change := <-msrv.subGlobalConfig.MsgChan():
+			msrv.subGlobalConfig.ProcessChange(change)
 
 		case <-ctx.Done():
 			return nil
@@ -605,7 +692,7 @@ func (msrv *Msrv) Run(ctx context.Context) (err error) {
 // MakeMetadataHandler creates http.Handler to be used by LinuxNIReconciler
 func (msrv *Msrv) MakeMetadataHandler() http.Handler {
 	r := chi.NewRouter()
-	zedcloudCtx := zedcloud.NewContext(msrv.Log, zedcloud.ContextOptions{})
+	ctrlClient := controllerconn.NewClient(msrv.Log, controllerconn.ClientOptions{})
 
 	r.Route("/eve/v1", func(r chi.Router) {
 		r.Get("/network.json", msrv.handleNetwork())
@@ -623,11 +710,12 @@ func (msrv *Msrv) MakeMetadataHandler() http.Handler {
 		r.Get("/discover-network.json", msrv.handleAppInstanceDiscovery())
 
 		r.Get("/wwan/status.json", msrv.handleWWANStatus())
-		r.Get("/wwan/metrics.json", msrv.handleWWANMeterics())
+		r.Get("/wwan/metrics.json", msrv.handleWWANMetrics())
+		r.Get("/networks/metrics.json", msrv.handleNetworkStatusMetrics())
 
 		r.Get("/app/info.json", msrv.handleAppInfo())
 
-		r.Post("/tpm/signer", msrv.handleSigner(&zedcloudCtx))
+		r.Post("/tpm/signer", msrv.handleSigner(ctrlClient))
 
 		r.Post("/tpm/activatecredential/", msrv.handleActivateCredentialPost())
 		r.Get("/tpm/activatecredential/", msrv.handleActivateCredentialGet())
@@ -639,6 +727,12 @@ func (msrv *Msrv) MakeMetadataHandler() http.Handler {
 			r.Get("/download/{patch}", msrv.handlePatchDownload())
 			r.Get("/download/{patch}/{file}", msrv.handlePatchFileDownload())
 		})
+	})
+
+	target, _ := url.Parse(NodeExporterMetricsURL)
+	r.Route("/metrics", func(r chi.Router) {
+		r.Use(msrv.withRateLimiterPerIP())
+		r.HandleFunc("/", msrv.reverseProxy(target))
 	})
 
 	r.Get("/eve/app-custom-blobs", msrv.handleAppCustomBlobs())

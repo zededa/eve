@@ -47,8 +47,9 @@ func (t *MockConnectivityTester) SetConnectivityError(dpcKey, ifName string, err
 }
 
 // TestConnectivity simulates connectivity test.
-func (t *MockConnectivityTester) TestConnectivity(dns types.DeviceNetworkStatus,
-	withNetTrace bool) (intfStatusMap types.IntfStatusMap, tracedReqs []netdump.TracedNetRequest, err error) {
+func (t *MockConnectivityTester) TestConnectivity(
+	dns types.DeviceNetworkStatus, airGapMode AirGapMode, withNetTrace bool) (
+	intfStatusMap types.IntfStatusMap, tracedReqs []netdump.TracedNetRequest, err error) {
 	t.Lock()
 	defer t.Unlock()
 
@@ -70,7 +71,7 @@ func (t *MockConnectivityTester) TestConnectivity(dns types.DeviceNetworkStatus,
 
 	for _, ifName := range intfs {
 		if successCount >= requiredSuccessCount {
-			// We have enough uplinks with cloud connectivity working.
+			// We have enough uplinks with controller connectivity working.
 			break
 		}
 		if _, exists, _ := t.NetworkMonitor.GetInterfaceIndex(ifName); !exists {

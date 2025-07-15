@@ -16,7 +16,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +28,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	envp "github.com/hashicorp/go-envparse"
 	zconfig "github.com/lf-edge/eve-api/go/config"
+	"github.com/lf-edge/eve/pkg/pillar/activeapp"
 	"github.com/lf-edge/eve/pkg/pillar/agentbase"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/base"
@@ -69,6 +72,10 @@ const (
 // Really a constant
 var nilUUID = uuid.UUID{}
 
+// Information related to VGA access
+var vgaSwitch = false
+var currentTTY = 0
+
 func isPort(ctx *domainContext, ifname string) bool {
 	ctx.dnsLock.Lock()
 	defer ctx.dnsLock.Unlock()
@@ -99,6 +106,7 @@ type domainContext struct {
 	pubProcessMetric       pubsub.Publication
 	pubCipherBlockStatus   pubsub.Publication
 	pubCapabilities        pubsub.Publication
+	subNodeAgentStatus     pubsub.Subscription
 	cipherMetrics          *cipher.AgentMetrics
 	createSema             *sema.Semaphore
 	GCComplete             bool
@@ -146,6 +154,7 @@ var hyper hypervisor.Hypervisor // Current hypervisor
 var logger *logrus.Logger
 var log *base.LogObject
 
+// Run - Main function
 func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, arguments []string, baseDir string) int { //nolint:gocyclo
 	logger = loggerArg
 	log = logArg
@@ -303,6 +312,23 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		log.Fatal(err)
 	}
 	domainCtx.pubCapabilities = capabilitiesInfoPub
+
+	// Look for nodeagent status
+	subNodeAgentStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "nodeagent",
+		MyAgentName: agentName,
+		TopicImpl:   types.NodeAgentStatus{},
+		Activate:    false,
+		Persistent:  false,
+		Ctx:         &domainCtx,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	domainCtx.subNodeAgentStatus = subNodeAgentStatus
+	subNodeAgentStatus.Activate()
 
 	// Look for controller certs which will be used for decryption
 	subControllerCert, err := ps.NewSubscription(pubsub.SubscriptionOptions{
@@ -550,7 +576,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 			}
 
 		// Run stillRunning since we waiting for zedagent to deliver
-		// PhysicalIO which depends on cloud connectivity
+		// PhysicalIO which depends on controller connectivity
 		case <-stillRunning.C:
 		}
 		ps.StillRunning(agentName, warningTime, errorTime)
@@ -619,8 +645,20 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		} else {
 			// If device rebooted abruptly, kubernetes did not get time to stop the VMs.
 			// They will be in failed state, so clean them up if they exists.
-			count, err := kubeapi.CleanupStaleVMI()
-			log.Noticef("domainmgr cleanup vmi count %d, %v", count, err)
+			// We have to do this only on single node config. In the cluster setup the VMs
+			// will be running on some other node after failover.
+			// Even in single node one might wonder why we need to delete VMI when node is coming up
+			// after reboot !! This is for very corner case, if the user deleted the app in the controller when
+			// the device is powered off. Next config refresh will see app is gone and domainmgr will not do anything.
+			// But kubernetes thinks app is still running and starts. So its safe to delete all replica sets at the start
+			// on single node installs.
+			clusterMode := kubeapi.IsClusterMode()
+
+			if !clusterMode {
+				count, err := kubeapi.CleanupStaleVMIRs()
+				log.Noticef("domainmgr cleanup vmirs count %d, %v", count, err)
+			}
+
 		}
 	}
 
@@ -655,6 +693,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 
 	for {
 		select {
+		case change := <-subNodeAgentStatus.MsgChan():
+			subNodeAgentStatus.ProcessChange(change)
+
 		case change := <-subControllerCert.MsgChan():
 			subControllerCert.ProcessChange(change)
 
@@ -991,7 +1032,7 @@ func verifyStatus(ctx *domainContext, status *types.DomainStatus) {
 			// the only remedy is an explicit user action (delete, restart, etc.)
 			if domainStatus == types.BROKEN {
 				err := fmt.Errorf("one of the %s tasks has crashed (%v)", status.Key(), err)
-				log.Errorf(err.Error())
+				log.Error(err.Error())
 				status.SetErrorNow("one of the application's tasks has crashed - please restart application instance")
 				status.State = types.BROKEN
 			} else {
@@ -1148,23 +1189,41 @@ func maybeRetryBoot(ctx *domainContext, status *types.DomainStatus) {
 	}
 	defer file.Close()
 
-	wp := &types.WatchdogParam{Ps: ctx.ps, AgentName: agentName, WarnTime: warningTime, ErrTime: errorTime}
-	err = hyper.Task(status).VirtualTPMSetup(status.DomainName, wp)
-	if err == nil {
-		status.VirtualTPM = true
-		defer func(status *types.DomainStatus, wp *types.WatchdogParam) {
-			// this means we failed to boot the VM.
-			if !status.Activated {
-				log.Noticef("Failed to activate domain: %s, terminating vTPM", status.DomainName)
-				if err := hyper.Task(status).VirtualTPMTerminate(status.DomainName, wp); err != nil {
-					// this is not a critical failure so just log it
-					log.Errorf("Failed to terminate vTPM for %s: %s", status.DomainName, err)
-				}
-			}
-		}(status, wp)
-	} else {
+	// setup Windows OEM license key if enabled
+	if config.EnableOemWinLicenseKey {
+		getDmiSystemInfo(&config.OemWindowsLicenseKeyInfo.SystemInfo)
+		err = hyper.Task(status).OemWindowsLicenseKeySetup(&config.OemWindowsLicenseKeyInfo)
+		if err != nil {
+			// let the VM to boot and just log the error? or terminate?
+			log.Errorf("Failed to setup Windows OEM license key for %s: %s", status.DomainName, err)
+			status.PassthroughWindowsLicenseKey = false
+		} else {
+			status.PassthroughWindowsLicenseKey = true
+		}
+	}
+
+	if config.DisableVirtualTPM {
+		log.Warnf("vTPM is disabled for %s by user request", status.DomainName)
 		status.VirtualTPM = false
-		log.Errorf("Failed to setup vTPM for %s: %s", status.DomainName, err)
+	} else {
+		wp := &types.WatchdogParam{Ps: ctx.ps, AgentName: agentName, WarnTime: warningTime, ErrTime: errorTime}
+		err = hyper.Task(status).VirtualTPMSetup(status.DomainName, wp)
+		if err == nil {
+			status.VirtualTPM = true
+			defer func(status *types.DomainStatus, wp *types.WatchdogParam) {
+				// this means we failed to boot the VM.
+				if !status.Activated {
+					log.Noticef("Failed to activate domain: %s, terminating vTPM", status.DomainName)
+					if err := hyper.Task(status).VirtualTPMTerminate(status.DomainName, wp); err != nil {
+						// this is not a critical failure so just log it
+						log.Errorf("Failed to terminate vTPM for %s: %s", status.DomainName, err)
+					}
+				}
+			}(status, wp)
+		} else {
+			status.VirtualTPM = false
+			log.Errorf("Failed to setup vTPM for %s: %s", status.DomainName, err)
+		}
 	}
 
 	if err := hyper.Task(status).Setup(*status, *config, ctx.assignableAdapters, nil, file); err != nil {
@@ -1352,6 +1411,7 @@ func handleCreate(ctx *domainContext, key string, config *types.DomainConfig) {
 		VmConfig:       config.VmConfig,
 		Service:        config.Service,
 		NodeName:       ctx.nodeName,
+		DeploymentType: config.DeploymentType,
 	}
 
 	status.VmConfig.CPUs = make([]int, 0)
@@ -1396,7 +1456,7 @@ func usbControllersWithoutPCIReserve(ioBundles []types.IoBundle) map[string][]*t
 	usbControllerGroups := make(map[string][]*types.IoBundle) // assigngrp -> iobundle
 
 	for i, ioBundle := range ioBundles {
-		if ioBundle.Type != types.IoUSBController {
+		if !ioBundle.IsUSBController() {
 			continue
 		}
 
@@ -1479,7 +1539,7 @@ func doAssignIoAdaptersToDomain(ctx *domainContext, config types.DomainConfig,
 			}
 			// Also checked in reserveAdapters. Check here in case there was a late error.
 			if !ib.Error.Empty() {
-				return fmt.Errorf(ib.Error.String())
+				return errors.New(ib.Error.String())
 			}
 			if ib.UsbAddr != "" {
 				log.Functionf("Assigning %s (%s) to %s",
@@ -1695,23 +1755,41 @@ func doActivate(ctx *domainContext, config types.DomainConfig,
 	}
 	defer file.Close()
 
-	wp := &types.WatchdogParam{Ps: ctx.ps, AgentName: agentName, WarnTime: warningTime, ErrTime: errorTime}
-	err = hyper.Task(status).VirtualTPMSetup(status.DomainName, wp)
-	if err == nil {
-		status.VirtualTPM = true
-		defer func(status *types.DomainStatus, wp *types.WatchdogParam) {
-			// this means we failed to boot the VM.
-			if !status.Activated {
-				log.Noticef("Failed to activate domain: %s, terminating vTPM", status.DomainName)
-				if err := hyper.Task(status).VirtualTPMTerminate(status.DomainName, wp); err != nil {
-					// this is not a critical failure so just log it
-					log.Errorf("Failed to terminate vTPM for %s: %s", status.DomainName, err)
-				}
-			}
-		}(status, wp)
-	} else {
+	// setup Windows OEM license key if enabled
+	if config.EnableOemWinLicenseKey {
+		getDmiSystemInfo(&config.OemWindowsLicenseKeyInfo.SystemInfo)
+		err = hyper.Task(status).OemWindowsLicenseKeySetup(&config.OemWindowsLicenseKeyInfo)
+		if err != nil {
+			// let the VM to boot and just log the error? or terminate?
+			log.Errorf("Failed to setup Windows OEM license key for %s: %s", status.DomainName, err)
+			status.PassthroughWindowsLicenseKey = false
+		} else {
+			status.PassthroughWindowsLicenseKey = true
+		}
+	}
+
+	if config.DisableVirtualTPM {
+		log.Warnf("vTPM is disabled for %s by user request", status.DomainName)
 		status.VirtualTPM = false
-		log.Errorf("Failed to setup vTPM for %s: %s", status.DomainName, err)
+	} else {
+		wp := &types.WatchdogParam{Ps: ctx.ps, AgentName: agentName, WarnTime: warningTime, ErrTime: errorTime}
+		err = hyper.Task(status).VirtualTPMSetup(status.DomainName, wp)
+		if err == nil {
+			status.VirtualTPM = true
+			defer func(status *types.DomainStatus, wp *types.WatchdogParam) {
+				// this means we failed to boot the VM.
+				if !status.Activated {
+					log.Noticef("Failed to activate domain: %s, terminating vTPM", status.DomainName)
+					if err := hyper.Task(status).VirtualTPMTerminate(status.DomainName, wp); err != nil {
+						// this is not a critical failure so just log it
+						log.Errorf("Failed to terminate vTPM for %s: %s", status.DomainName, err)
+					}
+				}
+			}(status, wp)
+		} else {
+			status.VirtualTPM = false
+			log.Errorf("Failed to setup vTPM for %s: %s", status.DomainName, err)
+		}
 	}
 
 	globalConfig := agentlog.GetGlobalConfig(log, ctx.subGlobalConfig)
@@ -1846,6 +1924,9 @@ func doActivateTail(ctx *domainContext, status *types.DomainStatus,
 	}
 
 	status.Activated = true
+	// create a new json file in the filesystem for the specific VM.
+	activeapp.CreateLocalAppActiveFile(log, status.UUIDandVersion.UUID.String())
+
 	log.Functionf("doActivateTail(%v) done for %s",
 		status.UUIDandVersion, status.DisplayName)
 }
@@ -1987,6 +2068,16 @@ func doCleanup(ctx *domainContext, status *types.DomainStatus) {
 		status)
 	status.IoAdapterList = nil
 	publishDomainStatus(ctx, status)
+
+	// Remove the boot file for the app instance unless the device is currently rebooting/shutting down.
+	items := ctx.subNodeAgentStatus.GetAll()
+	for _, st := range items {
+		if agentStatus, ok := st.(types.NodeAgentStatus); ok {
+			if !agentStatus.DeviceReboot && !agentStatus.DevicePoweroff && !agentStatus.DeviceShutdown {
+				activeapp.DelLocalAppActiveFile(log, status.UUIDandVersion.UUID.String())
+			}
+		}
+	}
 
 	log.Functionf("doCleanup(%v) done for %s",
 		status.UUIDandVersion, status.DisplayName)
@@ -3473,9 +3564,84 @@ func updateUsbAccess(ctx *domainContext) {
 
 func updateVgaAccess(ctx *domainContext) {
 
-	log.Functionf("updateVgaAccess(%t)", ctx.usbAccess)
-	// TODO: we might need some extra work here for some VGA devices
-	// that do not enable output upon HDMI cable attachment
+	log.Functionf("updateVgaAccess(%t)", ctx.vgaAccess)
+
+	if ctx.vgaAccess {
+		// If VGA is disabled, we need to first bring any VGA PCIe adapter back
+		updatePortAndPciBackIoBundleAll(ctx)
+		checkIoBundleAll(ctx)
+
+		// Nothing to do if VGA is already enabled
+		if vgaSwitch {
+			// VGA access was set to true and it was disabled before, so we
+			// need to perform the "switch VGA back" operations:
+			//
+			// 1. Re-bind framebuffer drivers
+			// 2. Restore activated VTs
+			// 3. Switch back to the last active TTY
+			if err := fbBindAll(); err != nil {
+				log.Errorf("Cannot bind framebuffer drivers: %v", err)
+			}
+			if err := vtBindAll(); err != nil {
+				log.Errorf("Cannot bind Virtual Terminals: %v", err)
+			}
+			if err := chvt(currentTTY); err != nil {
+				log.Errorf("Cannot switch to VT: %v", err)
+			}
+			vgaSwitch = false
+		}
+
+		return
+	}
+
+	if !vgaSwitch {
+		// Get active TTY, in case of error just consider tty2 which is
+		// the one used by TUI Monitor
+		ttyDev, err := getActiveTTY()
+		if err != nil {
+			log.Errorf("Fail to get active TTY: %v", err)
+			currentTTY = 2
+		} else {
+			re := regexp.MustCompile("tty([0-9]+)")
+			match := re.FindStringSubmatch(ttyDev)
+			if len(match) != 2 {
+				log.Errorf("Fail to get active TTY index")
+				currentTTY = 2
+			} else {
+				index, err := strconv.Atoi(match[1])
+				if err != nil {
+					log.Errorf("Fail to get active TTY index: %v", err)
+					currentTTY = 2
+				} else {
+					currentTTY = index
+				}
+			}
+		}
+
+		// Perform the following operations to "disable" VGA:
+		// 1. Switch to the next free Virtual Terminal (VT), so screen
+		// goes black
+		// 2. Detach all active VTs
+		// 3. Unbind all framebuffer drivers
+		freeVT, err := findFreeVT()
+		if err != nil {
+			// In case of error, just use a higher VT
+			log.Errorf("Cannot find a free VT: %v", err)
+			freeVT = 9
+		}
+		if err := chvt(freeVT); err != nil {
+			log.Errorf("Cannot switch to VT: %v", err)
+		}
+		if err := vtUnbindAll(); err != nil {
+			log.Errorf("Cannot unbind Virtual Terminals: %v", err)
+		}
+		if err := fbUnbindAll(); err != nil {
+			log.Errorf("Cannot unbind framebuffer drivers: %v", err)
+		}
+
+		vgaSwitch = true
+	}
+
 	updatePortAndPciBackIoBundleAll(ctx)
 	checkIoBundleAll(ctx)
 }
@@ -3670,4 +3836,41 @@ func (ctx *domainContext) checkAndSaveEdgeNodeInfo() bool {
 		}
 	}
 	return false
+}
+
+func getDmiSystemInfo(dmi *types.DmiSystemInfo) {
+	validate := func(a string) string {
+		a = strings.TrimSpace(a)
+		if strings.Contains(a, ",") {
+			logrus.Warnf("Invalid value: %s", a)
+			return ""
+		}
+		return a
+	}
+
+	dmidecode := func(arg string) string {
+		cmd := exec.Command("dmidecode", "-s", arg)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			logrus.Warnf("Failed to run dmidecode %s : %v", arg, err)
+			return ""
+		}
+
+		return validate(string(output))
+	}
+
+	dmi.Manufacturer = validate(dmidecode("system-manufacturer"))
+	dmi.ProductName = validate(dmidecode("system-product-name"))
+	dmi.Version = validate(dmidecode("system-version"))
+	dmi.SerialNumber = validate(dmidecode("system-serial-number"))
+	dmi.SKUNumber = validate(dmidecode("system-sku-number"))
+	dmi.Family = validate(dmidecode("system-family"))
+	dmi.UUID = validate(dmidecode("system-uuid"))
+	if dmi.UUID != "" {
+		_, err := uuid.FromString(dmi.UUID)
+		if err != nil {
+			logrus.Warnf("Invalid UUID: %s", dmi.UUID)
+			dmi.UUID = ""
+		}
+	}
 }

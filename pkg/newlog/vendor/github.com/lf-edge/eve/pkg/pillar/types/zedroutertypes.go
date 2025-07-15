@@ -28,6 +28,7 @@ type AppNetworkConfig struct {
 	CloudInitUserData *string `json:"pubsub-large-CloudInitUserData"`
 	CipherBlockStatus CipherBlockStatus
 	MetaDataType      MetaDataType
+	DeploymentType    AppRuntimeType
 }
 
 // Key :
@@ -112,6 +113,7 @@ type AppNetworkStatus struct {
 	AppPod cnirpc.AppPod
 	// Copy from the AppNetworkConfig; used to delete when config is gone.
 	GetStatsIPAddr       net.IP
+	DeploymentType       AppRuntimeType
 	AppNetAdapterList    []AppNetAdapterStatus
 	AwaitNetworkInstance bool // If any Missing flag is set in the networks
 	// ID of the MAC generator variant that was used to generate MAC addresses for this app.
@@ -282,7 +284,7 @@ type AppNetAdapterConfig struct {
 	Name       string           // From proto message
 	AppMacAddr net.HardwareAddr // If set use it for vif
 	AppIPAddr  net.IP           // If set use DHCP to assign to app
-	IntfOrder  int32            // XXX need to get from API
+	IntfOrder  uint32           // Order wrt. other virtual and also directly assigned network adapters
 
 	// XXX Shouldn't we use ErrorAndTime here
 	// Error
@@ -709,7 +711,7 @@ type NetworkInstanceConfig struct {
 	Subnet          net.IPNet
 	Gateway         net.IP
 	DomainName      string
-	NtpServer       net.IP
+	NtpServers      []string
 	DnsServers      []net.IP // If not set we use Gateway as DNS server
 	DhcpRange       IPRange
 	DnsNameToIPList []DNSNameToIP // Used for DNS and ACL ipset
@@ -980,7 +982,7 @@ type NetworkInstanceStatus struct {
 	// List of NTP servers published to applications connected to this network instance.
 	// This includes the NTP server from the NI config (if any) and all NTP servers
 	// associated with ports used by the network instance for external connectivity.
-	NTPServers []net.IP
+	NTPServers []string
 	// The intended state of the routing table.
 	// Includes user-configured static routes and potentially also automatically
 	// generated default route.
@@ -1372,3 +1374,22 @@ const (
 	// provides).
 	MACGeneratorClusterDeterministic = 3
 )
+
+// NestedAppDomainStatus - status of a nested app domain
+// This is the struct of the nested app reported by runtime agent, and it is
+// published by zedrouter. One use case is for 'newlogd' to get the App structure
+// set up the same mechainsm as if it learned from the domainmgr's DomainStatus.
+// Because this nested app domain is configured through the Patch-envelop directly
+// to the runtime agent, and bypasses the EVE pillar, although some of the EVE
+// services may still want to know about those nested apps.
+type NestedAppDomainStatus struct {
+	UUIDandVersion UUIDandVersion // UUID of the nested app, e.g. a Docker-Compose App UUID
+	DisplayName    string         // nested App name
+	DisableLogs    bool           // if app log is disabled
+	ParentAppUUID  uuid.UUID      // parent app, a runtime VM UUID
+}
+
+// Key - returns the UUID for the nested app domain status
+func (status NestedAppDomainStatus) Key() string {
+	return status.UUIDandVersion.UUID.String()
+}

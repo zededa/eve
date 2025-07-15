@@ -93,6 +93,23 @@ toggling roaming on or off, designating preferred network operators, and establi
 of preference for Radio Access Technologies (RATs). This comprehensive API empowers users to tailor
 cellular connectivity settings to suit various network scenarios and SIM card configurations.
 
+#### LTE Attach configuration
+
+LTE connection consists of two IP bearers, the initial (aka attach) EPS bearer and the default
+EPS bearer. Device must first establish the initial bearer (LTE attach procedure, which
+ModemManager shows as a transition from the `enabled`/`searching` to `registered` modem state)
+and then it connects to a default bearer (transition from `registered` to `connected`).
+Both bearers require PDP (Packet Data Protocol) context settings (`APN`, `ip-type`, potentially
+`username`/`password`, etc.). Settings for the initial bearer are typically provided by the modem
+profiles or the network, while settings for the default bearer are user-configured.
+However, there are cases, especially with private cellular networks or when changing SIM card
+and moving to another operator for which the modem was not pre-configured, where the modem
+may not provide the correct APN settings for the attach procedure and it will fail to register
+into the network. In these cases, the user can configure PDP settings within the `CellularAccessPoint`
+for the attach bearer (see the `attach_*` protobuf fields). All of these fields are optional.
+If they are not specified, EVE will not send any attach bearer configuration into the modem,
+leaving it to the modem profiles or the network to determine the appropriate settings.
+
 ### Cellular info and metrics
 
 The list of all cellular modems visible to the host (incl. the unused ones, without network config attached),
@@ -170,6 +187,55 @@ cards over eSIM. Specifically, if the device is preconfigured (e.g., by the manu
 as the primary slot and the user has not explicitly set the slot index via the controller, EVE
 automatically designates the first physical slot (with the lowest index) as the primary option.
 EVE will only attempt to connect with the eSIM if the user explicitly selects the eSIM slot.
+
+### Modem (Un)reliability and recovery mechanisms in EVE OS
+
+Modern cellular modems are critical for connectivity but often suffer from instability
+due to firmware, driver, or management software issues. EVE OS incorporates reactive
+recovery mechanisms to mitigate these issues and stabilize device connectivity.
+
+**Main challenges in modem stability**:
+
+* Unreliable modem firmware: proprietary and vendor-supplied modem firmware often contains
+  bugs that can lead to crashes or unresponsiveness. These issues are outside the control
+  of the OS and require recovery strategies.
+
+* Community-maintained drivers: Linux kernel drivers for modem control and data-plane
+  protocols (QMI, MBIM, MHI) are developed by the open-source community rather than
+  the modem manufacturers. This can result in compatibility gaps, occasional breakage,
+  or incomplete error handling.
+
+* ModemManager limitations/bugs: the ModemManager daemon may contain internal bugs
+  or fail to properly recognize and reinitialize modem after it rebooted due to firmware
+  issues.
+
+**EVE OS recovery strategies**:
+
+To address these challenges, EVE OS implements the following automated recovery
+mechanisms in MMAgent triggered when modem disappears or gets marked by ModemManager
+as invalid:
+
+1. **Driver reload recovery**: As part of the "soft-recovery" process (i.e. before
+   watchdog-triggered device reboot), MMAgent can attempt to reload the relevant
+   kernel drivers (MBIM/QMI/MHI) to reinitialize the modem.
+   This recovery method is disabled by default but can be enabled via the configuration
+   option `wwan.modem.recovery.reload.drivers`.
+
+2. **ModemManager restart**: As part of the "soft-recovery" process, MMagent may attempt
+   to restart ModemManager -- either alongside or as an alternative to driver reloading.
+   This addresses cases where the issue stems partially or entirely from ModemManager’s state
+   (e.g., unresponsive daemon, stale session handling, or internal errors).
+   This recovery method is disabled by default but can be enabled via the configuration
+   option `wwan.modem.recovery.restart.modemmanager`.
+
+3. **Watchdog-based recovery**: If a modem fails to recover after a crash and becomes
+   permanently unavailable, the watchdog mechanism can trigger a full device
+   reboot -- a "hard-recovery" last-resort option.
+   This recovery method is disabled by default but can be enabled via the configuration
+   option `wwan.modem.recovery.watchdog`.
+
+These recovery methods aim to improve reliability in the face of unstable modem firmware
+or driver/ModemManager issues.
 
 ## Radio Silence
 

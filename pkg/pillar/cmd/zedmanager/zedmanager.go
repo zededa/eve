@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/lf-edge/eve/pkg/pillar/activeapp"
 	"github.com/lf-edge/eve/pkg/pillar/agentbase"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/base"
@@ -33,8 +34,9 @@ import (
 const (
 	agentName = "zedmanager"
 	// Time limits for event loop handlers
-	errorTime   = 3 * time.Minute
-	warningTime = 40 * time.Second
+	errorTime                 = 3 * time.Minute
+	warningTime               = 40 * time.Second
+	waitForAppsToStartTimeout = 5 * time.Minute
 )
 
 // State used by handlers
@@ -101,7 +103,6 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		agentbase.WithArguments(arguments))
 
 	ctx.assignableAdapters = &types.AssignableAdapters{}
-
 	// Run a periodic timer so we always update StillRunning
 	stillRunning := time.NewTicker(25 * time.Second)
 	ps.StillRunning(agentName, warningTime, errorTime)
@@ -449,6 +450,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 
 	// The ticker that triggers a check for the applications in the START_DELAYED state
 	delayedStartTicker := time.NewTicker(1 * time.Second)
+	priorityStartTicker := time.NewTicker(5 * time.Second)
 
 	log.Functionf("Handling all inputs")
 	for {
@@ -506,6 +508,8 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		case <-delayedStartTicker.C:
 			checkDelayedStartApps(&ctx)
 
+		case <-priorityStartTicker.C:
+			checkLowPriorityApps(&ctx)
 		case <-stillRunning.C:
 		}
 		ps.StillRunning(agentName, warningTime, errorTime)
@@ -602,6 +606,39 @@ func checkDelayedStartApps(ctx *zedmanagerContext) {
 			status.State = types.INSTALLED
 			doUpdate(ctx, config, status)
 			publishAppInstanceStatus(ctx, status)
+		}
+	}
+}
+
+// Handle the applications in Low Priority state ready to be started.
+// Get the list of the Apps in High priority state and check if they are running.
+// If all the High priority apps are running or the timeout has expired, then
+// we can start the Low priority apps.
+func checkLowPriorityApps(ctx *zedmanagerContext) {
+	activeAppsUUIDs, err := activeapp.LoadActiveAppInstanceUUIDs(log)
+	if err != nil {
+		log.Warningf("checkLowPriorityApps: failed to load active app instance UUIDs: %v", err)
+		activeAppsUUIDs = []string{} // Fallback to an empty list
+	}
+	activeMap := make(map[string]struct{})
+	for _, uuid := range activeAppsUUIDs {
+		activeMap[uuid] = struct{}{}
+	}
+	log.Functionf("check low priority apps: %v", activeMap)
+	runningCount := countRunningAppsForUUIDs(ctx, activeMap)
+	if runningCount >= uint(len(activeMap)) || time.Now().After(ctx.delayBaseTime.Add(waitForAppsToStartTimeout)) {
+		configs := ctx.subAppInstanceConfig.GetAll()
+		for _, c := range configs {
+			config := c.(types.AppInstanceConfig)
+			if localConfig := lookupLocalAppInstanceConfig(ctx, config.Key()); localConfig != nil {
+				config = *localConfig
+			}
+			status := lookupAppInstanceStatus(ctx, config.Key())
+			if status != nil && status.NoBootPriority {
+				doUpdate(ctx, config, status)
+				status.NoBootPriority = false
+				publishAppInstanceStatus(ctx, status)
+			}
 		}
 	}
 }
@@ -829,18 +866,26 @@ func lookupLocalAppInstanceConfig(ctx *zedmanagerContext, key string) *types.App
 	return &config
 }
 
-func isSnapshotRequestedOnUpdate(status *types.AppInstanceStatus, config types.AppInstanceConfig) bool {
-	if config.Snapshot.Snapshots == nil {
-		return false
-	}
+func snapshotRequestedType(status *types.AppInstanceStatus, config types.AppInstanceConfig) types.SnapshotWhen {
+	ret := types.NoSnapshotTake
+
 	for _, snap := range config.Snapshot.Snapshots {
-		// VM should be marked to be snapshotted on update only if there is any snapshot request of the type "on update"
-		// that is not handled yet.
-		if snap.SnapshotType == types.SnapshotTypeAppUpdate && lookupAvailableSnapshot(status, snap.SnapshotID) == nil {
-			return true
+		if lookupAvailableSnapshot(status, snap.SnapshotID) != nil {
+			continue
+		}
+
+		switch snap.SnapshotType {
+		case types.SnapshotTypeUnspecified:
+			ret = types.NoSnapshotTake
+		case types.SnapshotTypeAppUpdate:
+			ret = types.SnapshotOnUpgrade
+		case types.SnapshotTypeImmediate:
+			// Immediate snapshots have precedence over snapshots on upgrade
+			return types.SnapshotImmediate
 		}
 	}
-	return false
+
+	return ret
 }
 
 // removeNUnpublishedSnapshotRequests removes up to n snapshot requests that have not been triggered yet
@@ -985,7 +1030,7 @@ func isNewSnapshotRequest(id string, status *types.AppInstanceStatus) bool {
 
 // Update the snapshot related fields in the AppInstanceStatus
 func updateSnapshotsInAIStatus(status *types.AppInstanceStatus, config types.AppInstanceConfig) {
-	status.SnapStatus.SnapshotOnUpgrade = isSnapshotRequestedOnUpdate(status, config)
+	status.SnapStatus.SnapshotTakenType = snapshotRequestedType(status, config)
 	//markReportedSnapshots(status, config)
 	status.SnapStatus.MaxSnapshots = config.Snapshot.MaxSnapshots
 	snapshotsToBeDeleted := getSnapshotsToBeDeleted(config, status)
@@ -1021,7 +1066,7 @@ func updateSnapshotsInAIStatus(status *types.AppInstanceStatus, config types.App
 func prepareVolumesSnapshotConfigs(ctx *zedmanagerContext, config types.AppInstanceConfig, status *types.AppInstanceStatus) []types.VolumesSnapshotConfig {
 	var volumesSnapshotConfigList []types.VolumesSnapshotConfig
 	for _, snapshot := range status.SnapStatus.RequestedSnapshots {
-		if snapshot.Snapshot.SnapshotType == types.SnapshotTypeAppUpdate {
+		if snapshot.Snapshot.SnapshotType == types.SnapshotTypeAppUpdate || snapshot.Snapshot.SnapshotType == types.SnapshotTypeImmediate {
 			log.Noticef("Creating volumesSnapshotConfig for snapshot %s", snapshot.Snapshot.SnapshotID)
 			volumesSnapshotConfig := types.VolumesSnapshotConfig{
 				SnapshotID: snapshot.Snapshot.SnapshotID,
@@ -1264,9 +1309,11 @@ func handleModify(ctxArg interface{}, key string,
 	if needPurge {
 		needRestart = false
 	}
+
 	// A snapshot is deemed necessary whenever the application requires a restart, as this typically
 	// indicates a significant change in the application, such as an upgrade.
-	if status.SnapStatus.SnapshotOnUpgrade && (needRestart || needPurge) {
+	if status.SnapStatus.SnapshotTakenType == types.SnapshotImmediate ||
+		(status.SnapStatus.SnapshotTakenType == types.SnapshotOnUpgrade && (needRestart || needPurge)) {
 		// Save the list of the volumes that need to be backed up. We will use this list to create the snapshot when
 		// it's triggered. We cannot trigger the snapshot creation here immediately, as the VM
 		// should be stopped first. But we still need to save the list of volumes that are known only at this point.
@@ -1277,6 +1324,25 @@ func handleModify(ctxArg interface{}, key string,
 				config.UUIDandVersion, config.DisplayName, err)
 			// Do not report it to the controller, as the controller do not expect snapshot-creation related errors
 		}
+	}
+
+	if status.SnapStatus.SnapshotTakenType == types.SnapshotImmediate {
+		// this is okay as a clash with updated volumes is prevented later by
+		// "Need purge due to %s but not a purgeCmd", so if the user
+		// updates the volumes but does not set the purgeCmd but does
+		// an immediate snapshot, the immediate snapshot will not trigger
+		// an update of the volumes as the purgeCmd is missing
+		status.PurgeInprogress = types.DownloadAndVerify
+		status.PurgeStartedAt = time.Now()
+		restartReason = "Restart to create immediate snapshot"
+	}
+
+	// Check if we need to roll back to a snapshot, and if so, mark the application
+	// as in purge state. We can apply snapshot only when the application is halted.
+	if status.SnapStatus.HasRollbackRequest {
+		status.PurgeInprogress = types.DownloadAndVerify
+		status.PurgeStartedAt = time.Now()
+		restartReason = "Restart to rollback snapshot"
 	}
 
 	if config.RestartCmd.Counter != oldConfig.RestartCmd.Counter ||
@@ -1419,7 +1485,7 @@ func quantifyChanges(config types.AppInstanceConfig, oldConfig types.AppInstance
 		str := fmt.Sprintf("number of volume ref changed from %d to %d",
 			len(oldConfig.VolumeRefConfigList),
 			len(config.VolumeRefConfigList))
-		log.Functionf(str)
+		log.Function(str)
 		needPurge = true
 		purgeReason += str + "\n"
 	} else {
@@ -1441,7 +1507,7 @@ func quantifyChanges(config types.AppInstanceConfig, oldConfig types.AppInstance
 		str := fmt.Sprintf("number of AppNetAdapter changed from %d to %d",
 			len(oldConfig.AppNetAdapterList),
 			len(config.AppNetAdapterList))
-		log.Functionf(str)
+		log.Function(str)
 		needPurge = true
 		purgeReason += str + "\n"
 	} else {
@@ -1450,21 +1516,21 @@ func quantifyChanges(config types.AppInstanceConfig, oldConfig types.AppInstance
 			if old.AppMacAddr.String() != uc.AppMacAddr.String() {
 				str := fmt.Sprintf("AppMacAddr changed from %v to %v",
 					old.AppMacAddr, uc.AppMacAddr)
-				log.Functionf(str)
+				log.Function(str)
 				needPurge = true
 				purgeReason += str + "\n"
 			}
 			if !old.AppIPAddr.Equal(uc.AppIPAddr) {
 				str := fmt.Sprintf("AppIPAddr changed from %v to %v",
 					old.AppIPAddr, uc.AppIPAddr)
-				log.Functionf(str)
+				log.Function(str)
 				needPurge = true
 				purgeReason += str + "\n"
 			}
 			if old.Network != uc.Network {
 				str := fmt.Sprintf("Network changed from %v to %v",
 					old.Network, uc.Network)
-				log.Functionf(str)
+				log.Function(str)
 				needPurge = true
 				purgeReason += str + "\n"
 			}
@@ -1477,14 +1543,14 @@ func quantifyChanges(config types.AppInstanceConfig, oldConfig types.AppInstance
 	if !cmp.Equal(config.IoAdapterList, oldConfig.IoAdapterList) {
 		str := fmt.Sprintf("IoAdapterList changed: %v",
 			cmp.Diff(oldConfig.IoAdapterList, config.IoAdapterList))
-		log.Functionf(str)
+		log.Function(str)
 		needPurge = true
 		purgeReason += str + "\n"
 	}
 	if !cmp.Equal(config.FixedResources, oldConfig.FixedResources) {
 		str := fmt.Sprintf("FixedResources changed: %v",
 			cmp.Diff(oldConfig.FixedResources, config.FixedResources))
-		log.Functionf(str)
+		log.Function(str)
 		needRestart = true
 		restartReason += str + "\n"
 	}
@@ -1632,6 +1698,27 @@ func updateBasedOnProfile(ctx *zedmanagerContext, oldProfile string) {
 			}
 		}
 	}
+}
+
+// countRunningAppsForUUIDs returns the number of app instances (from the provided uuidMap)
+// that are in a running state (BOOTING, RUNNING, HALTING, START_DELAYED).
+func countRunningAppsForUUIDs(ctx *zedmanagerContext, uuidMap map[string]struct{}) (runningCount uint) {
+	sub := ctx.subAppInstanceStatus
+	items := sub.GetAll()
+	log.Noticef("countRunningAppsForUUIDs: %d items", len(items))
+	for _, s := range items {
+		status := s.(types.AppInstanceStatus)
+		log.Noticef("countRunningAppsForUUIDs: %s %s", status.UUIDandVersion, status.State)
+		// Check if this status belongs to one of the app UUIDs in our map.
+		if _, exists := uuidMap[status.UUIDandVersion.UUID.String()]; !exists {
+			continue
+		}
+		switch status.State {
+		case types.BOOTING, types.RUNNING, types.HALTING, types.START_DELAYED:
+			runningCount++
+		}
+	}
+	return runningCount
 }
 
 // returns effective Activate status based on Activate from app instance config, current profile

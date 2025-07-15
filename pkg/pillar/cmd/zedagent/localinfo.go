@@ -15,10 +15,10 @@ import (
 
 	"github.com/lf-edge/eve-api/go/info"
 	"github.com/lf-edge/eve-api/go/profile"
+	"github.com/lf-edge/eve/pkg/pillar/activeapp"
 	"github.com/lf-edge/eve/pkg/pillar/flextimer"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	fileutils "github.com/lf-edge/eve/pkg/pillar/utils/file"
-	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	uuid "github.com/satori/go.uuid"
 	"github.com/shirou/gopsutil/host"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -143,8 +143,8 @@ func postLocalAppInfo(ctx *getconfigContext) *profile.LocalAppCmdList {
 		for _, srv := range servers {
 			fullURL := srv.localServerAddr + localAppInfoURLPath
 			appCmds := &profile.LocalAppCmdList{}
-			resp, err := zedcloud.SendLocalProto(
-				zedcloudCtx, fullURL, bridgeName, srv.bridgeIP, localInfo, appCmds)
+			resp, err := ctrlClient.SendLocalProto(
+				fullURL, bridgeName, srv.bridgeIP, localInfo, appCmds)
 			if err != nil {
 				errList = append(errList, fmt.Sprintf("SendLocalProto: %v", err))
 				continue
@@ -295,7 +295,7 @@ func triggerLocalCommand(ctx *getconfigContext, cmd types.AppCommand,
 		appCounters.RestartCmd.Counter++
 		appCounters.RestartCmd.ApplyTime = timestamp
 		app.LocalRestartCmd = appCounters.RestartCmd
-		checkAndPublishAppInstanceConfig(ctx, *app)
+		checkAndPublishAppInstanceConfig(ctx.pubAppInstanceConfig, *app)
 
 	case types.AppCommandPurge:
 		// To trigger application purge we take the previously published
@@ -328,16 +328,16 @@ func triggerLocalCommand(ctx *getconfigContext, cmd types.AppCommand,
 				continue
 			}
 			volume := volObj.(types.VolumeConfig)
-			unpublishVolumeConfig(ctx, volKey)
+			unpublishVolumeConfig(ctx.pubVolumeConfig, volKey)
 			// Publish volume with an increased local generation counter.
 			localGenCounter++
 			ctx.sideController.localCommands.VolumeGenCounters[uuid] = localGenCounter
 			vr.LocalGenerationCounter = localGenCounter
 			volume.LocalGenerationCounter = localGenCounter
-			publishVolumeConfig(ctx, volume)
+			publishVolumeConfig(ctx.pubVolumeConfig, volume)
 			changedVolumes = true
 		}
-		checkAndPublishAppInstanceConfig(ctx, *app)
+		checkAndPublishAppInstanceConfig(ctx.pubAppInstanceConfig, *app)
 	}
 	return changedVolumes
 }
@@ -406,6 +406,7 @@ func delLocalAppConfig(ctx *getconfigContext, appUUID string) {
 	delete(ctx.sideController.localCommands.AppCommands, appUUID)
 	delete(ctx.sideController.localCommands.AppCounters, appUUID)
 	persistLocalCommands(ctx.sideController.localCommands)
+	activeapp.DelLocalAppActiveFile(log, appUUID)
 }
 
 // Add config submitted for the volume via local profile server.
@@ -641,9 +642,8 @@ func postLocalDevInfo(ctx *getconfigContext) *profile.LocalDevCmd {
 		for _, srv := range servers {
 			fullURL := srv.localServerAddr + localDevInfoURLPath
 			devCmd := &profile.LocalDevCmd{}
-			resp, err := zedcloud.SendLocalProto(
-				zedcloudCtx, fullURL, bridgeName, srv.bridgeIP,
-				localInfo, devCmd)
+			resp, err := ctrlClient.SendLocalProto(
+				fullURL, bridgeName, srv.bridgeIP, localInfo, devCmd)
 			if err != nil {
 				errList = append(errList, fmt.Sprintf("SendLocalProto: %v", err))
 				continue

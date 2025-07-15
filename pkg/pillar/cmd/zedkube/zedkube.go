@@ -30,7 +30,7 @@ const (
 	errorTime            = 3 * time.Minute
 	warningTime          = 40 * time.Second
 	stillRunningInterval = 25 * time.Second
-	logcollectInterval   = 30
+	logcollectInterval   = 10
 	// run VNC file
 	vmiVNCFileName = "/run/zedkube/vmiVNC.run"
 
@@ -68,6 +68,7 @@ type zedkube struct {
 	pubENClusterAppStatus    pubsub.Publication
 	pubKubeClusterInfo       pubsub.Publication
 	pubLeaderElectInfo       pubsub.Publication
+	pubKubeUserServices      pubsub.Publication
 
 	subNodeDrainRequestZA  pubsub.Subscription
 	subNodeDrainRequestBoM pubsub.Subscription
@@ -95,8 +96,8 @@ type zedkube struct {
 	drainOverrideTimer       *time.Timer
 
 	// Config Properties for Drain
-	drainTimeoutHours                  uint32
-	drainSkipK8sAPINotReachableTimeout uint32
+	drainTimeout                       time.Duration
+	drainSkipK8sAPINotReachableTimeout time.Duration
 
 	// Block 'uncordon' after running it once at bootup
 	onBootUncordonCheckComplete bool
@@ -175,7 +176,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	log = logArg
 
 	zedkubeCtx := zedkube{
-		globalConfig: types.DefaultConfigItemValueMap(),
+		globalConfig:                       types.DefaultConfigItemValueMap(),
+		drainSkipK8sAPINotReachableTimeout: time.Duration(time.Second * types.DefaultDrainSkipK8sAPINotReachableTimeoutSeconds),
+		drainTimeout:                       time.Duration(time.Hour * types.DefaultDrainTimeoutHours),
 	}
 
 	// do we run a single command, or long-running service?
@@ -296,6 +299,16 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		log.Fatal(err)
 	}
 	zedkubeCtx.pubKubeClusterInfo = pubKubeClusterInfo
+
+	pubKubeUserServices, err := ps.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName: agentName,
+			TopicType: types.KubeUserServices{},
+		})
+	if err != nil {
+		log.Fatal(err)
+	}
+	zedkubeCtx.pubKubeUserServices = pubKubeUserServices
 
 	pubLeaderElectInfo, err := ps.NewPublication(
 		pubsub.PublicationOptions{
@@ -515,6 +528,10 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		log.Errorf("zedkube: WaitForKubenetes %v", err)
 	}
 
+	err = zedkubeCtx.initKubePrefixes()
+	if err != nil { // should never happen
+		log.Fatalf("zedkube: initKubePrefixes %v", err)
+	}
 	appLogTimer := time.NewTimer(logcollectInterval * time.Second)
 
 	log.Notice("zedkube online")
@@ -531,6 +548,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 			zedkubeCtx.collectAppLogs()
 			zedkubeCtx.checkAppsStatus()
 			zedkubeCtx.collectKubeStats()
+			zedkubeCtx.collectKubeSvcs()
 			appLogTimer = time.NewTimer(logcollectInterval * time.Second)
 
 		case change := <-subGlobalConfig.MsgChan():
@@ -653,7 +671,7 @@ func handleGlobalConfigImpl(ctxArg interface{}, key string,
 		if newDrainTimeout != 0 && newDrainTimeout != existingDrainTimeout {
 			log.Functionf("handleGlobalConfigImpl: Updating drainTimeoutHours from %d to %d",
 				existingDrainTimeout, newDrainTimeout)
-			z.drainTimeoutHours = newDrainTimeout
+			z.drainTimeout = time.Hour * time.Duration(newDrainTimeout)
 		}
 
 		//
@@ -664,7 +682,7 @@ func handleGlobalConfigImpl(ctxArg interface{}, key string,
 		if newDrainK8sAPINotReachableTimeout != 0 && newDrainK8sAPINotReachableTimeout != existingDrainK8sAPINotReachableTimeout {
 			log.Functionf("handleGlobalConfigImpl: Updating drainSkipK8sApiTimeout from %d to %d",
 				existingDrainK8sAPINotReachableTimeout, newDrainK8sAPINotReachableTimeout)
-			z.drainSkipK8sAPINotReachableTimeout = newDrainK8sAPINotReachableTimeout
+			z.drainSkipK8sAPINotReachableTimeout = time.Second * time.Duration(newDrainK8sAPINotReachableTimeout)
 		}
 	}
 	log.Functionf("handleGlobalConfigImpl(%s): done", key)
@@ -712,7 +730,7 @@ func handleEdgeNodeClusterConfigDelete(ctxArg interface{}, key string,
 	publishNodeDrainStatus(z, kubeapi.NOTSUPPORTED)
 }
 
-// handle zedagent status events, for cloud connectivity
+// handle zedagent status events, for controller connectivity
 func handleZedAgentStatusCreate(ctxArg interface{}, key string,
 	statusArg interface{}) {
 	handleZedAgentStatusImpl(ctxArg, key, statusArg)

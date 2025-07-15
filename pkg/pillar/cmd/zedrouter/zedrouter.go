@@ -38,7 +38,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/cmd/msrv"
-	"github.com/lf-edge/eve/pkg/pillar/devicenetwork"
+	"github.com/lf-edge/eve/pkg/pillar/controllerconn"
 	"github.com/lf-edge/eve/pkg/pillar/flextimer"
 	"github.com/lf-edge/eve/pkg/pillar/netmonitor"
 	"github.com/lf-edge/eve/pkg/pillar/nireconciler"
@@ -49,7 +49,6 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/utils/generics"
 	"github.com/lf-edge/eve/pkg/pillar/utils/wait"
-	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	"github.com/sirupsen/logrus"
 )
 
@@ -135,8 +134,8 @@ type zedrouter struct {
 	appContainerLogger          *logrus.Logger
 
 	// Agent metrics
-	zedcloudMetrics    *zedcloud.AgentMetrics
-	pubZedcloudMetrics pubsub.Publication
+	agentMetrics    *controllerconn.AgentMetrics
+	pubAgentMetrics pubsub.Publication
 
 	// Flow recording
 	pubAppFlowMonitor pubsub.Publication
@@ -154,6 +153,9 @@ type zedrouter struct {
 	// Kubernetes networking
 	withKubeNetworking bool
 	cniRequests        chan *rpcRequest
+
+	// publist nested App Status
+	pubNestedAppDomainStatus pubsub.Publication
 }
 
 // AddAgentSpecificCLIFlags adds CLI options
@@ -214,7 +216,7 @@ func (z *zedrouter) init() (err error) {
 	z.flowPublishMap = make(map[string]time.Time)
 	z.deviceNetworkStatus = &types.DeviceNetworkStatus{}
 
-	z.zedcloudMetrics = zedcloud.NewAgentMetrics()
+	z.agentMetrics = controllerconn.NewAgentMetrics()
 
 	z.withKubeNetworking = base.IsHVTypeKube()
 	z.cniRequests = make(chan *rpcRequest)
@@ -251,7 +253,7 @@ func (z *zedrouter) init() (err error) {
 		return err
 	}
 	// Must be done before calling nistate.NewLinuxCollector.
-	if err = z.ensureDir(devicenetwork.DnsmasqLeaseDir); err != nil {
+	if err = z.ensureDir(types.DnsmasqLeaseDir); err != nil {
 		return err
 	}
 
@@ -384,8 +386,8 @@ func (z *zedrouter) run(ctx context.Context) (err error) {
 				z.log.Error(err)
 			}
 
-			err = z.zedcloudMetrics.Publish(
-				z.log, z.pubZedcloudMetrics, "global")
+			err = z.agentMetrics.Publish(
+				z.log, z.pubAgentMetrics, "global")
 			if err != nil {
 				z.log.Errorln(err)
 			}
@@ -569,10 +571,19 @@ func (z *zedrouter) initPublications() (err error) {
 		log.Fatal(err)
 	}
 
-	z.pubZedcloudMetrics, err = z.pubSub.NewPublication(
+	z.pubAgentMetrics, err = z.pubSub.NewPublication(
 		pubsub.PublicationOptions{
 			AgentName: agentName,
 			TopicType: types.MetricsMap{},
+		})
+	if err != nil {
+		return err
+	}
+
+	z.pubNestedAppDomainStatus, err = z.pubSub.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName: agentName,
+			TopicType: types.NestedAppDomainStatus{},
 		})
 	if err != nil {
 		return err

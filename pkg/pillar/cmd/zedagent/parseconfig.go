@@ -21,6 +21,7 @@ import (
 	zconfig "github.com/lf-edge/eve-api/go/config"
 	zevecommon "github.com/lf-edge/eve-api/go/evecommon"
 	"github.com/lf-edge/eve/pkg/pillar/objtonum"
+	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/sriov"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	fileutils "github.com/lf-edge/eve/pkg/pillar/utils/file"
@@ -500,6 +501,7 @@ func publishNetworkInstanceConfig(ctx *getconfigContext,
 			STPConfig: types.STPConfig{
 				PortsWithBpduGuard: apiConfigEntry.GetStp().GetPortsWithBpduGuard(),
 			},
+			ForwardLLDP: apiConfigEntry.ForwardLldp,
 		}
 		uuidStr := networkInstanceConfig.UUID.String()
 		log.Functionf("publishNetworkInstanceConfig: processing %s %s type %d activate %v",
@@ -582,14 +584,27 @@ func parseConnectivityProbe(probe *zconfig.ConnectivityProbe) (
 	case zconfig.ConnectivityProbeMethod_CONNECTIVITY_PROBE_METHOD_ICMP:
 		parsedProbe.Method = types.ConnectivityProbeMethodICMP
 		parsedProbe.ProbeHost = probe.GetProbeEndpoint().GetHost()
-		if parsedProbe.ProbeHost == "" {
-			return parsedProbe, errors.New("missing endpoint host address for ICMP probe")
+		// Undefined host for ICMP probing is allowed - EVE will probe Google DNS
+		// (8.8.8.8) in that case.
+		// However, if host address is defined, it should be a valid IP address.
+		if parsedProbe.ProbeHost != "" {
+			probeIP := net.ParseIP(parsedProbe.ProbeHost)
+			if probeIP == nil {
+				return parsedProbe, fmt.Errorf("invalid IP address for ICMP probe: %s",
+					parsedProbe.ProbeHost)
+			}
 		}
 	case zconfig.ConnectivityProbeMethod_CONNECTIVITY_PROBE_METHOD_TCP:
 		parsedProbe.Method = types.ConnectivityProbeMethodTCP
+		// Host address should be a valid (and non-empty) IP address.
 		parsedProbe.ProbeHost = probe.GetProbeEndpoint().GetHost()
 		if parsedProbe.ProbeHost == "" {
 			return parsedProbe, errors.New("missing endpoint host address for TCP probe")
+		}
+		probeIP := net.ParseIP(parsedProbe.ProbeHost)
+		if probeIP == nil {
+			return parsedProbe, fmt.Errorf("invalid IP address for TCP probe: %s",
+				parsedProbe.ProbeHost)
 		}
 		probePort := probe.GetProbeEndpoint().GetPort()
 		if probePort == 0 {
@@ -634,7 +649,8 @@ var appinstancePrevConfigHash []byte
 
 func parseAppInstanceConfig(getconfigCtx *getconfigContext,
 	config *zconfig.EdgeDevConfig) {
-
+	// This checks if the configuration that we get from the server has changed.
+	// if not, we will leave the function. Else we will try to create the Apps.
 	Apps := config.GetApps()
 	h := sha256.New()
 	for _, a := range Apps {
@@ -654,7 +670,8 @@ func parseAppInstanceConfig(getconfigCtx *getconfigContext,
 
 	devUUIDStr := config.GetId().Uuid
 
-	// First look for deleted ones
+	// First look for deleted ones. Look for Apps that exists on EVE OS, but not in the config
+	// file from the server. If yes, we will remove the App from the EVE OS.
 	items := getconfigCtx.pubAppInstanceConfig.GetAll()
 	for uuidStr := range items {
 		found := false
@@ -704,6 +721,8 @@ func parseAppInstanceConfig(getconfigCtx *getconfigContext,
 		appInstance.Service = cfgApp.Service
 		appInstance.CloudInitVersion = cfgApp.CloudInitVersion
 		appInstance.FixedResources.CPUsPinned = cfgApp.Fixedresources.PinCpu
+		appInstance.FixedResources.EnableOemWinLicenseKey = cfgApp.Fixedresources.EnableOemWinLicenseKey
+		appInstance.FixedResources.DisableVirtualTPM = cfgApp.Fixedresources.DisableVtpm
 
 		// Parse the snapshot related fields
 		if cfgApp.Snapshot != nil {
@@ -715,7 +734,14 @@ func parseAppInstanceConfig(getconfigCtx *getconfigContext,
 		parseVolumeRefList(appInstance.VolumeRefConfigList, cfgApp.GetVolumeRefList(), appInstance.UUIDandVersion.UUID)
 
 		// fill in the collect stats IP address of the App
+		// Get the runtime deployment type of the App
 		appInstance.CollectStatsIPAddr = net.ParseIP(cfgApp.GetCollectStatsIPAddr())
+		switch cfgApp.GetRuntimeType() {
+		case zconfig.AppRuntimeType_APP_RUNTIME_TYPE_DOCKER:
+			appInstance.DeploymentType = types.AppRuntimeTypeDocker
+		default:
+			appInstance.DeploymentType = types.AppRuntimeTypeUnSpecified
+		}
 
 		// fill the app adapter config
 		parseAppNetworkConfig(&appInstance, cfgApp, config.Networks,
@@ -765,7 +791,16 @@ func parseAppInstanceConfig(getconfigCtx *getconfigContext,
 			appInstance.CloudInitUserData = &userData
 		}
 		appInstance.RemoteConsole = cfgApp.GetRemoteConsole()
-		appInstance.CipherBlockStatus = parseCipherBlock(getconfigCtx, appInstance.Key(), cfgApp.GetCipherData())
+
+		var err error
+		appInstance.CipherBlockStatus, err = parseCipherBlock(
+			getconfigCtx, appInstance.Key(), cfgApp.GetCipherData())
+		if err != nil {
+			log.Errorf("Failed to parse application %s cipher data: %v",
+				cfgApp.Displayname, err)
+			appInstance.SetErrorNow(err.Error())
+		}
+
 		appInstance.ProfileList = cfgApp.ProfileList
 
 		// Add config submitted via local profile server.
@@ -781,7 +816,7 @@ func parseAppInstanceConfig(getconfigCtx *getconfigContext,
 		}
 
 		// Verify that it fits and if not publish with error
-		checkAndPublishAppInstanceConfig(getconfigCtx, appInstance)
+		checkAndPublishAppInstanceConfig(getconfigCtx.pubAppInstanceConfig, appInstance)
 	}
 }
 
@@ -1235,7 +1270,7 @@ func parseOneSystemAdapterConfig(getconfigCtx *getconfigContext,
 	sysAdapter *zconfig.SystemAdapter, version types.DevicePortConfigVersion,
 ) (ports []*types.NetworkPortConfig, err error) {
 
-	log.Functionf("XXX parseOneSystemAdapterConfig name %s lowerLayerName %s",
+	log.Functionf("parseOneSystemAdapterConfig name %s lowerLayerName %s",
 		sysAdapter.Name, sysAdapter.LowerLayerName)
 
 	// We check if any phyio has FreeUplink set. If so we operate
@@ -1326,7 +1361,7 @@ func parseOneSystemAdapterConfig(getconfigCtx *getconfigContext,
 		if phyioFreeUplink || sysAdapter.FreeUplink {
 			portCost = 0
 		} else if oldController {
-			log.Warnf("XXX oldController and !FreeUplink; assume %s cost=1",
+			log.Warnf("oldController and !FreeUplink; assume %s cost=1",
 				sysAdapter.Name)
 			portCost = 1
 		}
@@ -1334,7 +1369,7 @@ func parseOneSystemAdapterConfig(getconfigCtx *getconfigContext,
 
 	var isMgmt bool
 	if version < types.DPCIsMgmt {
-		log.Warnf("XXX old version; assuming %s isMgmt and cost=0",
+		log.Warnf("old version; assuming %s isMgmt and cost=0",
 			sysAdapter.Name)
 		// This should go away when cloud sends proper values
 		isMgmt = true
@@ -1401,31 +1436,35 @@ func parseOneSystemAdapterConfig(getconfigCtx *getconfigContext,
 			// Need to be careful since zedcloud can feed us bad Dhcp type
 			port.Dhcp = network.Dhcp
 			port.IgnoreDhcpNtpServers = network.IgnoreDhcpNtpServers
-			switch port.Dhcp {
-			case types.DhcpTypeStatic:
-				if sysAdapter.Addr == "" {
-					errStr := fmt.Sprintf("Port %s configured with static IP config "+
-						"but IP address is not defined", port.Logicallabel)
-					log.Errorf("parseSystemAdapterConfig: %s", errStr)
-					port.RecordFailure(errStr)
-				}
-			case types.DhcpTypeClient:
-				// Do nothing
-			case types.DhcpTypeNone:
-				if isMgmt {
-					errStr := fmt.Sprintf("Port %s configured as Management port "+
-						"with an unsupported DHCP type %d. Client and static are "+
-						"the only allowed DHCP modes for management ports.",
-						port.Logicallabel, types.DhcpTypeNone)
+			// Skip port config validation if the associated network config is invalid,
+			// to avoid overriding the inherited network error.
+			if !network.HasError() {
+				switch port.Dhcp {
+				case types.DhcpTypeStatic:
+					if sysAdapter.Addr == "" {
+						errStr := fmt.Sprintf("Port %s configured with static IP config "+
+							"but IP address is not defined", port.Logicallabel)
+						log.Errorf("parseSystemAdapterConfig: %s", errStr)
+						port.RecordFailure(errStr)
+					}
+				case types.DhcpTypeClient:
+					// Do nothing
+				case types.DhcpTypeNone:
+					if isMgmt {
+						errStr := fmt.Sprintf("Port %s configured as Management port "+
+							"with an unsupported DHCP type %d. Client and static are "+
+							"the only allowed DHCP modes for management ports.",
+							port.Logicallabel, types.DhcpTypeNone)
 
+						log.Errorf("parseSystemAdapterConfig: %s", errStr)
+						port.RecordFailure(errStr)
+					}
+				default:
+					errStr := fmt.Sprintf("Port %s configured with unknown DHCP type %v",
+						port.Logicallabel, network.Dhcp)
 					log.Errorf("parseSystemAdapterConfig: %s", errStr)
 					port.RecordFailure(errStr)
 				}
-			default:
-				errStr := fmt.Sprintf("Port %s configured with unknown DHCP type %v",
-					port.Logicallabel, network.Dhcp)
-				log.Errorf("parseSystemAdapterConfig: %s", errStr)
-				port.RecordFailure(errStr)
 			}
 			// XXX use DnsNameToIpList?
 			if network.Proxy != nil {
@@ -1903,7 +1942,13 @@ func publishDatastoreConfig(ctx *getconfigContext,
 
 		datastore.DsCertPEM = ds.GetDsCertPEM()
 
-		datastore.CipherBlockStatus = parseCipherBlock(ctx, datastore.Key(), ds.GetCipherData())
+		var err error
+		datastore.CipherBlockStatus, err = parseCipherBlock(
+			ctx, datastore.Key(), ds.GetCipherData())
+		if err != nil {
+			log.Error(err)
+			datastore.SetErrorNow(err.Error())
+		}
 		ctx.pubDatastoreConfig.Publish(datastore.Key(), *datastore)
 	}
 }
@@ -1983,9 +2028,25 @@ func publishNetworkXObjectConfig(ctx *getconfigContext,
 }
 
 func parseOneNetworkXObjectConfig(ctx *getconfigContext, netEnt *zconfig.NetworkConfig) *types.NetworkXObjectConfig {
-
 	config := new(types.NetworkXObjectConfig)
-	config.Type = types.NetworkType(netEnt.Type)
+	switch netEnt.Type {
+	case zconfig.NetworkType_NETWORKTYPENOOP:
+		config.Type = types.NetworkTypeNOOP
+	case zconfig.NetworkType_V4:
+		config.Type = types.NetworkTypeIPv4
+	case zconfig.NetworkType_V6:
+		config.Type = types.NetworkTypeIPV6
+	case zconfig.NetworkType_V4Only:
+		config.Type = types.NetworkTypeIpv4Only
+	case zconfig.NetworkType_V6Only:
+		config.Type = types.NetworkTypeIpv6Only
+	default:
+		errStr := fmt.Sprintf("Unknown Network type (%s)", netEnt.Type.String())
+		log.Errorf("parseOneNetworkXObjectConfig (%s): %s", config.Key(), errStr)
+		config.SetErrorNow(errStr)
+		return config
+	}
+
 	id, err := uuid.FromString(netEnt.Id)
 	if err != nil {
 		errStr := fmt.Sprintf("Malformed UUID ignored: %s", err)
@@ -2041,17 +2102,21 @@ func parseOneNetworkXObjectConfig(ctx *getconfigContext, netEnt *zconfig.Network
 	}
 
 	// wireless property configuration
-	config.WirelessCfg = parseNetworkWirelessConfig(ctx, config.Key(), netEnt)
+	config.WirelessCfg, err = parseNetworkWirelessConfig(ctx, config.Key(), netEnt)
+	if err != nil {
+		log.Errorf("parseOneNetworkXObjectConfig (%s): %v", config.Key(), err)
+		config.SetErrorNow(err.Error())
+		return config
+	}
 
 	ipspec := netEnt.GetIp()
-	switch config.Type {
-	case types.NetworkTypeIPv4, types.NetworkTypeIPV6:
-		if ipspec == nil {
-			errStr := "Missing IP configuration"
-			log.Errorf("parseOneNetworkXObjectConfig (%s): %s", config.Key(), errStr)
-			config.SetErrorNow(errStr)
-			return config
-		}
+	if ipspec == nil && config.Type != types.NetworkTypeNOOP {
+		errStr := "Missing IP configuration"
+		log.Errorf("parseOneNetworkXObjectConfig (%s): %s", config.Key(), errStr)
+		config.SetErrorNow(errStr)
+		return config
+	}
+	if ipspec != nil {
 		err := parseIpspecNetworkXObject(ipspec, config)
 		if err != nil {
 			errStr := fmt.Sprintf("Invalid IP configuration: %s", err)
@@ -2059,25 +2124,6 @@ func parseOneNetworkXObjectConfig(ctx *getconfigContext, netEnt *zconfig.Network
 			config.SetErrorNow(errStr)
 			return config
 		}
-	case types.NetworkTypeNOOP:
-		// XXX is controller still sending static and dynamic entries with NetworkTypeNOOP? Why?
-		if ipspec != nil {
-			log.Warnf("XXX NetworkTypeNOOP for %s with ipspec %v",
-				config.Key(), ipspec)
-			err := parseIpspecNetworkXObject(ipspec, config)
-			if err != nil {
-				errStr := fmt.Sprintf("Invalid IP configuration: %s", err)
-				log.Errorf("parseOneNetworkXObjectConfig (%s): %s", config.Key(), errStr)
-				config.SetErrorNow(errStr)
-				return config
-			}
-		}
-
-	default:
-		errStr := fmt.Sprintf("Unknown Network type (%d)", config.Type)
-		log.Errorf("parseOneNetworkXObjectConfig (%s): %s", config.Key(), errStr)
-		config.SetErrorNow(errStr)
-		return config
 	}
 
 	// Parse and store DNSNameToIPList form Network configuration
@@ -2127,34 +2173,36 @@ func parseOneNetworkXObjectConfig(ctx *getconfigContext, netEnt *zconfig.Network
 	return config
 }
 
-func parseNetworkWirelessConfig(ctx *getconfigContext, key string, netEnt *zconfig.NetworkConfig) types.WirelessConfig {
-	var wconfig types.WirelessConfig
+func parseNetworkWirelessConfig(ctx *getconfigContext,
+	key string, netEnt *zconfig.NetworkConfig) (wconfig types.WirelessConfig, err error) {
 
 	netWireless := netEnt.GetWireless()
 	if netWireless == nil {
-		return wconfig
+		return wconfig, nil
 	}
-	log.Functionf("parseNetworkWirelessConfig: Wireless of network present in %s, config %v", netEnt.Id, netWireless)
+	log.Functionf("parseNetworkWirelessConfig: Wireless of network present in %s, config %v",
+		netEnt.Id, netWireless)
 
 	wType := netWireless.GetType()
 	switch wType {
+	case zconfig.WirelessType_TypeNOOP:
+		// This is not a wireless network adapter.
+		// Return an empty wireless configuration.
+		return wconfig, nil
 	case zconfig.WirelessType_Cellular:
 		wconfig.WType = types.WirelessTypeCellular
 		cellNetConfigs := netWireless.GetCellularCfg()
 		if len(cellNetConfigs) == 0 {
-			log.Errorf("parseNetworkWirelessConfig: missing cellular config in: %v",
-				netWireless)
-			return wconfig
+			err = errors.New("missing cellular config")
+			return wconfig, err
 		}
 		// CellularCfg should really have been defined in the EVE API as a single entry
 		// rather than as a list (for multiple SIM cards and APNs there is AccessPoints list
 		// underneath). However, marking this field as deprecated and creating a new non-list
 		// field seems unnecessary - let's instead expect single entry.
 		if len(cellNetConfigs) > 1 {
-			log.Errorf(
-				"parseNetworkWirelessConfig: unexpected multiple cellular configs in: %v",
-				netWireless)
-			return wconfig
+			err = errors.New("unexpected multiple cellular configs")
+			return wconfig, err
 		}
 		cellNetConfig := cellNetConfigs[0]
 		for _, accessPoint := range cellNetConfig.AccessPoints {
@@ -2165,19 +2213,9 @@ func parseNetworkWirelessConfig(ctx *getconfigContext, key string, netEnt *zconf
 			// should be activated.
 			ap.Activated = cellNetConfig.ActivatedSimSlot == 0 ||
 				cellNetConfig.ActivatedSimSlot == accessPoint.SimSlot
-			switch accessPoint.AuthProtocol {
-			case zconfig.CellularAuthProtocol_CELLULAR_AUTH_PROTOCOL_PAP:
-				ap.AuthProtocol = types.WwanAuthProtocolPAP
-			case zconfig.CellularAuthProtocol_CELLULAR_AUTH_PROTOCOL_CHAP:
-				ap.AuthProtocol = types.WwanAuthProtocolCHAP
-			case zconfig.CellularAuthProtocol_CELLULAR_AUTH_PROTOCOL_PAP_AND_CHAP:
-				ap.AuthProtocol = types.WwanAuthProtocolPAPAndCHAP
-			default:
-				log.Errorf("parseNetworkWirelessConfig: unrecognized AuthProtocol: %+v",
-					accessPoint)
-			}
-			if ap.AuthProtocol != types.WwanAuthProtocolNone {
-				ap.EncryptedCredentials = parseCipherBlock(ctx, key, accessPoint.GetCipherData())
+			ap.AuthProtocol, err = parseCellularAuthProtocol(accessPoint.AuthProtocol)
+			if err != nil {
+				return wconfig, err
 			}
 			for _, plmn := range accessPoint.PreferredPlmns {
 				ap.PreferredPLMNs = append(ap.PreferredPLMNs, plmn)
@@ -2193,11 +2231,32 @@ func parseNetworkWirelessConfig(ctx *getconfigContext, key string, netEnt *zconf
 				case zevecommon.RadioAccessTechnology_RADIO_ACCESS_TECHNOLOGY_5GNR:
 					ap.PreferredRATs = append(ap.PreferredRATs, types.WwanRAT5GNR)
 				default:
-					log.Errorf("parseNetworkWirelessConfig: unrecognized RAT: %+v",
-						accessPoint)
+					return wconfig, fmt.Errorf("unrecognized RAT: %+v", accessPoint)
 				}
 			}
 			ap.ForbidRoaming = accessPoint.ForbidRoaming
+			ap.IPType, err = parseCellularIPType(accessPoint.IpType)
+			if err != nil {
+				return wconfig, err
+			}
+			ap.AttachAPN = accessPoint.AttachApn
+			ap.AttachIPType, err = parseCellularIPType(accessPoint.AttachIpType)
+			if err != nil {
+				return wconfig, err
+			}
+			ap.AttachAuthProtocol, err = parseCellularAuthProtocol(
+				accessPoint.AttachAuthProtocol)
+			if err != nil {
+				return wconfig, err
+			}
+			if ap.AuthProtocol != types.WwanAuthProtocolNone ||
+				ap.AttachAuthProtocol != types.WwanAuthProtocolNone {
+				ap.EncryptedCredentials, err = parseCipherBlock(
+					ctx, key, accessPoint.GetCipherData())
+				if err != nil {
+					return wconfig, err
+				}
+			}
 			wconfig.CellularV2.AccessPoints = append(wconfig.CellularV2.AccessPoints, ap)
 		}
 		// For backward compatibility.
@@ -2211,9 +2270,9 @@ func parseNetworkWirelessConfig(ctx *getconfigContext, key string, netEnt *zconf
 		probeCfg := cellNetConfig.Probe
 		customProbe, err := parseConnectivityProbe(probeCfg.GetCustomProbe())
 		if err != nil {
-			log.Errorf("parseNetworkWirelessConfig: %v", err)
+			return wconfig, err
 		}
-		if customProbe.Method == types.ConnectivityProbeMethodNone || err != nil {
+		if customProbe.Method == types.ConnectivityProbeMethodNone {
 			// For backward compatibility.
 			if probeCfg.GetProbeAddress() != "" {
 				customProbe = types.ConnectivityProbe{
@@ -2244,21 +2303,59 @@ func parseNetworkWirelessConfig(ctx *getconfigContext, key string, netEnt *zconf
 			case zconfig.WiFiKeyScheme_WPAEAP:
 				wifi.KeyScheme = types.KeySchemeWpaEap
 			default:
-				log.Errorf("parseNetworkWirelessConfig: unrecognized WiFi Key scheme: %+v",
-					wificfg)
+				return wconfig, fmt.Errorf("unrecognized WiFi Key scheme: %+v",
+					wificfg.GetKeyScheme())
 			}
 			wifi.Identity = wificfg.GetIdentity()
 			wifi.Password = wificfg.GetPassword()
 			wifi.Priority = wificfg.GetPriority()
 			wifiKey := fmt.Sprintf("%s-%s", key, wifi.SSID)
-			wifi.CipherBlockStatus = parseCipherBlock(ctx, wifiKey, wificfg.GetCipherData())
+			wifi.CipherBlockStatus, err = parseCipherBlock(
+				ctx, wifiKey, wificfg.GetCipherData())
+			if err != nil {
+				return wconfig, err
+			}
 			wconfig.Wifi = append(wconfig.Wifi, wifi)
 		}
 		log.Functionf("parseNetworkWirelessConfig: Wireless of type Wifi, %v", wconfig.Wifi)
 	default:
-		log.Errorf("parseNetworkWirelessConfig: unsupported wireless configure type %d", wType)
+		return wconfig, fmt.Errorf("unsupported wireless type: %d", wType)
 	}
-	return wconfig
+	return wconfig, nil
+}
+
+func parseCellularAuthProtocol(
+	authProtocol zconfig.CellularAuthProtocol) (types.WwanAuthProtocol, error) {
+	switch authProtocol {
+	case zconfig.CellularAuthProtocol_CELLULAR_AUTH_PROTOCOL_NONE:
+		return types.WwanAuthProtocolNone, nil
+	case zconfig.CellularAuthProtocol_CELLULAR_AUTH_PROTOCOL_PAP:
+		return types.WwanAuthProtocolPAP, nil
+	case zconfig.CellularAuthProtocol_CELLULAR_AUTH_PROTOCOL_CHAP:
+		return types.WwanAuthProtocolCHAP, nil
+	case zconfig.CellularAuthProtocol_CELLULAR_AUTH_PROTOCOL_PAP_AND_CHAP:
+		return types.WwanAuthProtocolPAPAndCHAP, nil
+	default:
+		return types.WwanAuthProtocolNone, fmt.Errorf(
+			"unrecognized cellular AuthProtocol: %+v", authProtocol)
+	}
+}
+
+func parseCellularIPType(
+	ipType zevecommon.CellularIPType) (types.WwanIPType, error) {
+	switch ipType {
+	case zevecommon.CellularIPType_CELLULAR_IP_TYPE_UNSPECIFIED:
+		return types.WwanIPTypeUnspecified, nil
+	case zevecommon.CellularIPType_CELLULAR_IP_TYPE_IPV4:
+		return types.WwanIPTypeIPv4, nil
+	case zevecommon.CellularIPType_CELLULAR_IP_TYPE_IPV4_AND_IPV6:
+		return types.WwanIPTypeIPv4AndIPv6, nil
+	case zevecommon.CellularIPType_CELLULAR_IP_TYPE_IPV6:
+		return types.WwanIPTypeIPv6, nil
+	default:
+		return types.WwanIPTypeUnspecified, fmt.Errorf(
+			"unrecognized cellular IP type: %+v", ipType)
+	}
 }
 
 func parseIpspecNetworkXObject(ipspec *zconfig.Ipspec, config *types.NetworkXObjectConfig) error {
@@ -2492,9 +2589,9 @@ func parseAppNetAdapterConfig(appInstance *types.AppInstanceConfig,
 		adapterCfg.IfIdx = 0
 	}
 
-	// XXX remove? Debug?
+	// Debug logging for multiple network adapters
 	if len(appInstance.AppNetAdapterList) > 1 {
-		log.Functionf("XXX post sort %+v", appInstance.AppNetAdapterList)
+		log.Functionf("App network adapters after sorting: %+v", appInstance.AppNetAdapterList)
 	}
 }
 
@@ -2728,7 +2825,7 @@ func parseConfigItems(ctx *getconfigContext, config *zconfig.EdgeDevConfig,
 		if newCertInterval != oldCertInterval {
 			log.Functionf("parseConfigItems: %s change from %d to %d",
 				"CertInterval", oldCertInterval, newCertInterval)
-			updateCertTimer(newCertInterval, ctx.certTickerHandle)
+			updateTaskTimer(newCertInterval, ctx.certTickerHandle)
 		}
 		if newMetricInterval != oldMetricInterval {
 			log.Functionf("parseConfigItems: %s change from %d to %d",
@@ -2751,6 +2848,8 @@ func parseConfigItems(ctx *getconfigContext, config *zconfig.EdgeDevConfig,
 			ctx.zedagentCtx.gcpMaintenanceMode = newMaintenanceMode
 			mergeMaintenanceMode(ctx.zedagentCtx, "parseConfigItems")
 		}
+		airgapModeVal := newGlobalConfig.GlobalValueTriState(types.AirGapMode)
+		ctx.zedagentCtx.airgapMode = airgapModeVal == types.TS_ENABLED
 
 		pub := ctx.zedagentCtx.pubGlobalConfig
 		err := pub.Publish("global", *gcPtr)
@@ -2791,12 +2890,11 @@ func mergeMaintenanceMode(ctx *zedagentContext, caller string) {
 		ctx.apiMaintenanceMode, ctx.localMaintenanceMode)
 }
 
-func checkAndPublishAppInstanceConfig(getconfigCtx *getconfigContext,
+func checkAndPublishAppInstanceConfig(pub pubsub.Publication,
 	config types.AppInstanceConfig) {
 
 	key := config.Key()
 	log.Tracef("checkAndPublishAppInstanceConfig UUID %s", key)
-	pub := getconfigCtx.pubAppInstanceConfig
 	if err := pub.CheckMaxSize(key, config); err != nil {
 		log.Error(err)
 		var clearNumBytes int
@@ -3170,7 +3268,7 @@ func scheduleBackup(backup *zconfig.DeviceOpsCmd) {
 		return
 	}
 	log.Functionf("scheduleBackup: Applying updated config %v", backup)
-	log.Errorf("XXX handle Backup Config: %v", backup)
+	log.Errorf("handle Backup Config: %v", backup)
 }
 
 // user driven reboot/shutdown/poweroff command originating from controller or
@@ -3280,8 +3378,16 @@ func parseEdgeNodeClusterConfig(getconfigCtx *getconfigContext,
 		BootstrapNode:    isJoinNode,
 		// XXX EncryptedClusterToken is only for gcp config
 	}
-	enClusterConfig.CipherToken = parseCipherBlock(getconfigCtx,
+	enClusterConfig.CipherToken, err = parseCipherBlock(getconfigCtx,
 		enClusterConfig.Key(), zcfgCluster.GetEncryptedClusterToken())
+	if err != nil {
+		// TODO: Flag enClusterConfig with an error and propagate it to the controller.
+		log.Errorf("parseEdgeNodeClusterConfig: failed to parse encrypted cluster token: %v", err)
+		return
+	}
+	// These share a cipherblock
+	enClusterConfig.CipherGzipRegistrationManifestYaml = enClusterConfig.CipherToken
+
 	log.Functionf("parseEdgeNodeClusterConfig: ENCluster API, Config %+v, %v", zcfgCluster, enClusterConfig)
 	ctx.pubEdgeNodeClusterConfig.Publish("global", enClusterConfig)
 }

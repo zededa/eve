@@ -85,6 +85,7 @@ func initOpts() {
 		"edgeview",
 		"global",
 		"loguploader",
+		"msrv",
 		"newlogd",
 		"nim",
 		"nodeagent",
@@ -177,29 +178,30 @@ func isDefinedOpt(value string, optslice []string) bool {
 }
 
 // get url and path from JWT token string
-func getAddrFromJWT(token string, isServer bool, instID int) (string, string, error) {
+func getAddrFromJWT(token string, isServer bool, instID int) (string, string, types.EvAuthType, error) {
 	var addrport, path string
+	var evAuth types.EvAuthType
 	tparts := strings.Split(token, ".")
 	if len(tparts) != 3 {
-		return addrport, path, fmt.Errorf("no ip:port or invalid JWT")
+		return addrport, path, evAuth, fmt.Errorf("no ip:port or invalid JWT")
 	}
 
 	if instID > 0 {
 		if instID > types.EdgeviewMaxInstNum {
-			return addrport, path, fmt.Errorf("JWT inst number incorrect")
+			return addrport, path, evAuth, fmt.Errorf("JWT inst number incorrect")
 		}
 		edgeviewInstID = instID
 	}
 
 	data, err := base64.RawURLEncoding.DecodeString(tparts[1])
 	if err != nil {
-		return addrport, path, err
+		return addrport, path, evAuth, err
 	}
 
 	var jdata types.EvjwtInfo
 	err = json.Unmarshal(data, &jdata)
 	if err != nil {
-		return addrport, path, err
+		return addrport, path, evAuth, err
 	}
 
 	var uuidStr string
@@ -210,22 +212,25 @@ func getAddrFromJWT(token string, isServer bool, instID int) (string, string, er
 		}
 	}
 
+	// get the client authentication method
+	evAuth = types.EvAuthType(jdata.Aut)
+
 	if jdata.Exp == 0 || jdata.Dep == "" {
-		return addrport, path, fmt.Errorf("read JWT data failed")
+		return addrport, path, evAuth, fmt.Errorf("read JWT data failed")
 	}
 	if uuidStr != "" && jdata.Sub != uuidStr {
-		return addrport, path, fmt.Errorf("uuid does not match JWT jti")
+		return addrport, path, evAuth, fmt.Errorf("uuid does not match JWT jti")
 	}
 
 	now := time.Now()
 	nowSec := uint64(now.Unix())
 	if nowSec > jdata.Exp {
-		return addrport, path, fmt.Errorf("JWT expired %d sec ago", nowSec-jdata.Exp)
+		return addrport, path, evAuth, fmt.Errorf("JWT expired %d sec ago", nowSec-jdata.Exp)
 	}
 
 	if jdata.Num > 1 && instID < 1 {
 		if runOnServer {
-			return addrport, path, fmt.Errorf("Edgeview is in multi-instance mode, '-inst 1-%d' needs to be specified", jdata.Num)
+			return addrport, path, evAuth, fmt.Errorf("Edgeview is in multi-instance mode, '-inst 1-%d' needs to be specified", jdata.Num)
 		} else {
 			warnStr := fmt.Sprintf("Edgeview is in multi-instance mode, use '-inst 1-%d', try '-inst 1' here", jdata.Num)
 			fmt.Printf("%s\n", getColorStr(warnStr, colorCYAN))
@@ -233,10 +238,10 @@ func getAddrFromJWT(token string, isServer bool, instID int) (string, string, er
 		}
 	} else if jdata.Num == 1 && instID > 0 {
 		if runOnServer {
-			return addrport, path, fmt.Errorf("Edgeview is not in multi-instance mode, no need to specify inst-ID")
+			return addrport, path, evAuth, fmt.Errorf("Edgeview is not in multi-instance mode, no need to specify inst-ID")
 		} else {
 			if instID > 1 {
-				return addrport, path, fmt.Errorf("Maximum instance is 1, can not use inst %d", instID)
+				return addrport, path, evAuth, fmt.Errorf("Maximum instance is 1, can not use inst %d", instID)
 			}
 			fmt.Printf("%s\n", getColorStr("Edgeview is not in multi-instance mode, instance ignored here", colorCYAN))
 			edgeviewInstID = 0
@@ -249,7 +254,7 @@ func getAddrFromJWT(token string, isServer bool, instID int) (string, string, er
 	if strings.Contains(jdataDep, "/") {
 		urls := strings.SplitN(jdataDep, "/", 2)
 		if len(urls) != 2 {
-			return addrport, path, fmt.Errorf("JWT url invalid")
+			return addrport, path, evAuth, fmt.Errorf("JWT url invalid")
 		}
 		addrport = urls[0]
 		path = "/" + urls[1]
@@ -261,7 +266,7 @@ func getAddrFromJWT(token string, isServer bool, instID int) (string, string, er
 	evStatus.StartedOn = now
 	encryptVarInit(jdata)
 
-	return addrport, path, nil
+	return addrport, path, evAuth, nil
 }
 
 func checkClientIPMsg(msg string) bool {
@@ -312,7 +317,8 @@ func getBasics() {
 
 	ips := []string{}
 	for _, i := range allUPIntfIPv4() {
-		if strings.HasPrefix(i.intfName, "bn") {
+		// exclude the interfaces that are not used for device management
+		if strings.HasPrefix(i.intfName, "bn") || strings.HasPrefix(i.intfName, "flannel") || i.intfName == "cni0" {
 			continue
 		}
 		ips = append(ips, i.ipAddr)
@@ -349,27 +355,24 @@ func getBasics() {
 	}
 
 	if basics.server != "" {
-		var printed bool
-		conts := strings.Split(basics.server, "zedcloud.")
-		if len(conts) == 2 {
-			cont2s := strings.Split(conts[1], ".zededa.net")
-			if len(cont2s) == 2 { // color highlight the cluster name string
-				cluster := cont2s[0]
-				colorCluster := getColorStr(cluster, colorYELLOW)
-				controller := strings.Replace(basics.server, cluster, colorCluster, 1)
-				fmt.Printf("  Controller: %s", controller)
-				printed = true
-			}
+		var authenStr string
+		switch clientAuthType {
+		case types.EvAuthTypeSSHRsaKeys:
+			authenStr = fmt.Sprintf(", (authen %s)", "ssh-keys")
+		case types.EvAuthTypeControllerCert:
+			authenStr = fmt.Sprintf(", (authen %s)", "certs")
+		case types.EvAuthTypeUnspecified:
+			// No action needed for unspecified type
+		default:
+			log.Errorf("Unknown client authentication type: %v", clientAuthType)
 		}
-		if !printed {
-			fmt.Printf("  Controller: %s", basics.server)
-		}
+		fmt.Printf("  Controller: %s%s\n", basics.server, authenStr)
 	}
 
 	if basics.release == "" {
 		retbytes, err := os.ReadFile("/run/eve-release")
 		if err == nil {
-			basics.release = string(retbytes)
+			basics.release = strings.TrimSuffix(string(retbytes), "\n")
 		}
 	}
 
@@ -640,6 +643,7 @@ func printHelp(opt string) {
 			helpOn("flow[/<some pattern>]", "display ip flow information in the kernel search pattern")
 			helpExample("flow/sport=53", "display all the ip flow matches source port of 53", true)
 			helpExample("flow/10.1.0.2", "display all the ip flow matches ip address of 10.1.0.2", false)
+			helpExample("flow/dport=443 -line 20", "display the first 20 entries of the ip flow matches dst port of 443", false)
 		case "if":
 			helpOn("if[/intf-name]", "display interface related information briefly")
 			helpExample("if/eth0", "display interface eth0 related information", true)
@@ -660,6 +664,10 @@ func printHelp(opt string) {
 			helpOn("ping[/<ip or name>]", "ping to 8.8.8.8 from all the UP interfaces or ping a specific address")
 			helpExample("ping", "ping to 8.8.8.8 from each source IP address of the interfaces", true)
 			helpExample("ping/192.168.1.1", "ping the address of 192.168.1.1", false)
+		case "pub":
+			helpOn("pub/<micro-service name>[/<publication item]", "display the EVE micro-services pub-sub information")
+			helpExample("pub/zedagent", "display the zedagent micro-service all the pub-sub information", true)
+			helpExample("pub/zedagent/configitem", "display the zedagent micro-service the ConfigItem information", false)
 		case "route":
 			helpOn("route", "display all the ip rule and their ip table entries")
 		case "socket":
@@ -704,6 +712,7 @@ func printHelp(opt string) {
 			helpOn("pprof", "pprof/on to turn on pprof; pprof/off to turn off again")
 		case "dmesg":
 			helpOn("dmesg", "display the device current dmesg information")
+			helpExample("dmesg -line 25", "display the last 25 lines from the dmesg", true)
 		case "download":
 			helpOn("download", "display the download config and status during downloading operation and url stats since reboot")
 		case "du":

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/lf-edge/eve/pkg/pillar/activeapp"
 	"github.com/lf-edge/eve/pkg/pillar/hypervisor"
 	uuid "github.com/satori/go.uuid"
 
@@ -86,7 +87,7 @@ func removeAIStatus(ctx *zedmanagerContext, status *types.AppInstanceStatus) {
 	// The VM has been just shutdown in a result of the purge&update command coming from the controller.
 	if !uninstall && domainStatus != nil && !domainStatus.Activated {
 		// We should do it before the doRemove is called, so that all the volumes are still available.
-		if status.SnapStatus.SnapshotOnUpgrade && len(status.SnapStatus.PreparedVolumesSnapshotConfigs) > 0 {
+		if status.SnapStatus.SnapshotTakenType != types.NoSnapshotTake && len(status.SnapStatus.PreparedVolumesSnapshotConfigs) > 0 {
 			// Check whether there are snapshots to be deleted first (not to exceed the maximum number of snapshots).
 			if len(status.SnapStatus.SnapshotsToBeDeleted) > 0 {
 				triggerSnapshotDeletion(status.SnapStatus.SnapshotsToBeDeleted, ctx, status)
@@ -185,6 +186,29 @@ func doUpdate(ctx *zedmanagerContext,
 			return true
 		}
 	}
+
+	// Check if the App is low priority.
+	// Load the UUIDs of the apps that were previously (before the reboot) in the ACTIVE state.
+	var hasPriority bool
+	activeAppsUUIDs, err := activeapp.LoadActiveAppInstanceUUIDs(log)
+	if err != nil {
+		log.Warningf("checkLowPriorityApps: failed to load active app instance UUIDs: %v", err)
+		activeAppsUUIDs = []string{} // Fallback to an empty list
+	}
+	// Check if the app is in the active list
+	log.Functionf("Processing AppInstanceConfig for app with UUID: %s", config.UUIDandVersion.UUID.String())
+	for _, uuid := range activeAppsUUIDs {
+		log.Functionf("active app instance UUID: %s", uuid)
+		if uuid == config.UUIDandVersion.UUID.String() {
+			hasPriority = true
+		}
+	}
+	if !hasPriority && !status.NoBootPriority {
+		log.Functionf("low priority app %s", uuidStr)
+		status.NoBootPriority = true
+		return true
+	}
+
 	// The existence of Config is interpreted to mean the
 	// AppInstance should be INSTALLED. Activate is checked separately.
 	changed, done = doInstall(ctx, config, status)
@@ -248,6 +272,7 @@ func doUpdate(ctx *zedmanagerContext,
 		return changed
 	}
 	log.Functionf("Have config.Activate for %s", uuidStr)
+
 	c = doActivate(ctx, uuidStr, config, status)
 	changed = changed || c
 	log.Functionf("doUpdate done for %s", uuidStr)

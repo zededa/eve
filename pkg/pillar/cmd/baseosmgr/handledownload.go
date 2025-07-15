@@ -4,6 +4,7 @@
 package baseosmgr
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -102,7 +103,7 @@ func installDownloadedObject(ctx *baseOsMgrContext, contentID uuid.UUID, finalOb
 	}
 	refID = ctsPtr.ReferenceID()
 	if refID == "" {
-		log.Fatalf("XXX no image ID for LOADED %s",
+		log.Fatalf("Content tree status is LOADED but missing required image ID for content %s",
 			contentID)
 	}
 	log.Functionf("For %s reference ID for LOADED: %s",
@@ -115,7 +116,7 @@ func installDownloadedObject(ctx *baseOsMgrContext, contentID uuid.UUID, finalOb
 			contentID)
 		log.Errorln(errStr)
 		ctsPtr.SetErrorWithSource(errStr, types.ContentTreeStatus{}, time.Now())
-		return changed, proceed, fmt.Errorf(errStr)
+		return changed, proceed, errors.New(errStr)
 	}
 
 	// check if we have a result
@@ -124,7 +125,7 @@ func installDownloadedObject(ctx *baseOsMgrContext, contentID uuid.UUID, finalOb
 		log.Functionf("installDownloadedObject(%s): InstallWorkResult found", contentID)
 		if wres.Error != nil {
 			err := fmt.Errorf("installDownloadedObject(%s): InstallWorkResult error, exception while installing: %v", contentID, wres.Error)
-			log.Errorf(err.Error())
+			log.Error(err.Error())
 			return changed, proceed, err
 		}
 		changed = true

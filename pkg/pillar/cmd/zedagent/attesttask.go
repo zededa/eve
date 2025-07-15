@@ -13,15 +13,14 @@ import (
 	"reflect"
 	"strings"
 
-	eventlog "github.com/cshari-zededa/eve-tpm2-tools/eventlog"
 	"github.com/lf-edge/eve-api/go/attest"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	zattest "github.com/lf-edge/eve/pkg/pillar/attest"
+	"github.com/lf-edge/eve/pkg/pillar/controllerconn"
 	"github.com/lf-edge/eve/pkg/pillar/hardware"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/vault"
-	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -58,21 +57,16 @@ type attestContext struct {
 	Iteration int
 	// Started indicates that attest module was started
 	Started bool
-	//EventLogEntries are the TPM EventLog entries
-	EventLogEntries []eventlog.Event
-	//EventLogParseErr stores any error that happened during EventLog parsing
-	EventLogParseErr error
 }
 
 const (
 	watchdogInterval  = 15
 	retryTimeInterval = 15
-	//EventLogPath is the TPM measurement log aka TPM event log
-	EventLogPath = "/sys/kernel/security/tpm0/binary_bios_measurements"
 )
 
 // One shot send, if fails, return an error to the state machine to retry later
-func trySendToController(attestReq *attest.ZAttestReq, attestCtx *attestContext) (zedcloud.SendRetval, error) {
+func trySendToController(attestReq *attest.ZAttestReq,
+	attestCtx *attestContext, expectNoConn bool) (controllerconn.SendRetval, error) {
 	log.Noticef("trySendToController type %d", attestReq.ReqType)
 	data, err := proto.Marshal(attestReq)
 	if err != nil {
@@ -80,19 +74,23 @@ func trySendToController(attestReq *attest.ZAttestReq, attestCtx *attestContext)
 	}
 
 	buf := bytes.NewBuffer(data)
-	size := int64(proto.Size(attestReq))
-	attestURL := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API,
+	attestURL := controllerconn.URLPathString(serverNameAndPort, ctrlClient.UsingV2API(),
 		devUUID, "attest")
-	ctxWork, cancel := zedcloud.GetContextForAllIntfFunctions(zedcloudCtx)
+	ctxWork, cancel := ctrlClient.GetContextForAllIntfFunctions()
 	defer cancel()
 	const bailOnHTTPErr = true
 	const withNetTracing = false
-	rv, err := zedcloud.SendOnAllIntf(ctxWork, zedcloudCtx, attestURL, size, buf,
-		attestCtx.Iteration, bailOnHTTPErr, withNetTracing)
+	rv, err := ctrlClient.SendOnAllIntf(ctxWork, attestURL, buf,
+		controllerconn.RequestOptions{
+			WithNetTracing: withNetTracing,
+			BailOnHTTPErr:  bailOnHTTPErr,
+			Iteration:      attestCtx.Iteration,
+			SuppressLogs:   expectNoConn,
+		})
 	if err != nil || len(rv.RespContents) == 0 {
 		// Error case handled below
 	} else {
-		err = zedcloud.RemoveAndVerifyAuthContainer(zedcloudCtx, &rv, false)
+		err = ctrlClient.RemoveAndVerifyAuthContainer(&rv, false)
 	}
 	switch rv.Status {
 	case types.SenderStatusCertMiss, types.SenderStatusCertInvalid:
@@ -133,7 +131,7 @@ func (server *VerifierImpl) SendNonceRequest(ctx *zattest.Context) error {
 	var attestReq = &attest.ZAttestReq{}
 
 	// bail if V2API is not supported
-	if !zedcloud.UseV2API() {
+	if !ctrlClient.UsingV2API() {
 		return zattest.ErrNoVerifier
 	}
 
@@ -143,7 +141,8 @@ func (server *VerifierImpl) SendNonceRequest(ctx *zattest.Context) error {
 	attestCtx.Iteration++
 	log.Tracef("Sending Nonce request %v", attestReq)
 
-	rv, err := trySendToController(attestReq, attestCtx)
+	expectNoConn := attestCtx.zedagentCtx.airgapMode
+	rv, err := trySendToController(attestReq, attestCtx, expectNoConn)
 	if err != nil || rv.Status != types.SenderStatusNone {
 		errorDescription := types.ErrorDescription{
 			Error: fmt.Sprintf("[ATTEST] Error %v, senderStatus %v",
@@ -277,7 +276,7 @@ func (server *VerifierImpl) SendAttestQuote(ctx *zattest.Context) error {
 	var attestReq = &attest.ZAttestReq{}
 
 	// bail if V2API is not supported
-	if !zedcloud.UseV2API() {
+	if !ctrlClient.UsingV2API() {
 		return zattest.ErrNoVerifier
 	}
 
@@ -307,25 +306,15 @@ func (server *VerifierImpl) SendAttestQuote(ctx *zattest.Context) error {
 	}
 
 	attestReq.Quote = quote
-
-	if attestCtx.EventLogParseErr == nil {
-		//On some platforms, either the kernel does not export TPM Eventlog
-		//or the TPM does not have SHA256 bank enabled for PCRs. We populate
-		//eventlog if we are able to parse eventlog successfully
-		encodeEventLog(attestCtx, attestReq.Quote)
-
-		if len(attestReq.Quote.EventLog) > 0 && proto.Size(attestReq) > maxQuotePayloadSize {
-			log.Errorf("[ATTEST] attestReq size too much (%d) will remove large binaries", proto.Size(attestReq))
-			cleanupEventLog(attestReq.Quote)
-		}
-	}
+	// We may add the binary TPM logs to the attestation request here.
 
 	//Increment Iteration for interface rotation
 	attestCtx.Iteration++
 	log.Tracef("Sending Quote request")
 	recordAttestationTry(attestCtx.zedagentCtx)
 
-	rv, err := trySendToController(attestReq, attestCtx)
+	expectNoConn := attestCtx.zedagentCtx.airgapMode
+	rv, err := trySendToController(attestReq, attestCtx, expectNoConn)
 	if err != nil || rv.Status != types.SenderStatusNone {
 		errorDescription := types.ErrorDescription{
 			Error: fmt.Sprintf("[ATTEST] Error %v, senderStatus %v",
@@ -449,7 +438,7 @@ func (server *VerifierImpl) SendAttestEscrow(ctx *zattest.Context) error {
 			ctx.OpaqueCtx)
 	}
 	// bail if V2API is not supported
-	if !zedcloud.UseV2API() {
+	if !ctrlClient.UsingV2API() {
 		attestCtx.zedagentCtx.publishedAttestEscrow = true
 		return zattest.ErrNoVerifier
 	}
@@ -481,12 +470,15 @@ func (server *VerifierImpl) SendAttestEscrow(ctx *zattest.Context) error {
 	attestCtx.Iteration++
 	log.Noticef("[ATTEST] Sending Escrow data len %d", len(key.Key))
 
-	rv, err := trySendToController(attestReq, attestCtx)
+	expectNoConn := attestCtx.zedagentCtx.airgapMode
+	rv, err := trySendToController(attestReq, attestCtx, expectNoConn)
 	if err != nil || rv.Status != types.SenderStatusNone {
 		errorDescription := types.ErrorDescription{
 			Error: fmt.Sprintf("[ATTEST] Error %v, senderStatus %v", err, rv.Status),
 		}
-		log.Error(errorDescription.Error)
+		if !expectNoConn || rv.Status != types.SenderStatusNone {
+			log.Error(errorDescription.Error)
+		}
 		setAttestErrorAndTriggerInfo(ctx, errorDescription)
 		return zattest.ErrControllerReqFailed
 	}
@@ -584,45 +576,6 @@ func (wd *WatchdogImpl) PunchWatchdog(ctx *zattest.Context) error {
 	return nil
 }
 
-// parseTpmEventLog parses TPM Event Log and stores it given attestContext
-// any error during parsing is stored in EventLogParseErr
-func parseTpmEventLog(attestCtx *attestContext) {
-	events, err := eventlog.ParseEvents(EventLogPath)
-	attestCtx.EventLogEntries = events
-	attestCtx.EventLogParseErr = err
-	if err != nil {
-		log.Errorf("[ATTEST] Eventlog parsing error %v", err)
-	}
-}
-
-func encodeEventLog(attestCtx *attestContext, quoteMsg *attest.ZAttestQuote) error {
-	quoteMsg.EventLog = make([]*attest.TpmEventLogEntry, 0)
-	for _, event := range attestCtx.EventLogEntries {
-		tpmEventLog := new(attest.TpmEventLogEntry)
-		tpmEventLog.Index = uint32(event.Sequence)
-		tpmEventLog.PcrIndex = uint32(event.Index)
-		tpmEventLog.Digest = new(attest.TpmEventDigest)
-		tpmEventLog.Digest.HashAlgo = attest.TpmHashAlgo_TPM_HASH_ALGO_SHA256
-		tpmEventLog.Digest.Digest = event.Sha256Digest()
-		tpmEventLog.EventDataBinary = event.Data
-		tpmEventLog.EventBinarySize = uint32(len(event.Data))
-		tpmEventLog.EventType = uint32(event.Typ)
-		//Do not populate EventDataString for now because of possible size exceed
-
-		quoteMsg.EventLog = append(quoteMsg.EventLog, tpmEventLog)
-	}
-	return nil
-}
-
-// cleanupEventLog removes event binary data from EventLog which exceed size limit
-func cleanupEventLog(quoteMsg *attest.ZAttestQuote) {
-	for _, el := range quoteMsg.EventLog {
-		if el.EventBinarySize > eventLogBinarySizeLimit {
-			el.EventDataBinary = nil
-		}
-	}
-}
-
 // initialize attest pubsub trigger handlers and channels
 func attestModuleInitialize(ctx *zedagentContext) error {
 	zattest.RegisterExternalIntf(&TpmAgentImpl{}, &VerifierImpl{}, &WatchdogImpl{})
@@ -655,7 +608,6 @@ func attestModuleInitialize(ctx *zedagentContext) error {
 		log.Fatal(err)
 	}
 	ctx.attestCtx.pubEncryptedKeyFromController = pubEncryptedKeyFromController
-	parseTpmEventLog(ctx.attestCtx)
 	return nil
 }
 

@@ -772,16 +772,16 @@ func mmioVMMOverhead(domainName string, aa *types.AssignableAdapters, domainAdap
 			}
 			if ib.PciLong != "" && ib.UsbAddr == "" {
 				logrus.Infof("Adding PCI device <%s>\n", ib.PciLong)
-				tap := pciDevice{pciLong: ib.PciLong, ioType: ib.Type}
+				tap := pciDevice{ioBundle: *ib}
 				pciAssignments = addNoDuplicatePCI(pciAssignments, tap)
 			}
 		}
 	}
 
 	for _, dev := range pciAssignments {
-		logrus.Infof("PCI device %s %d\n", dev.pciLong, dev.ioType)
+		logrus.Infof("PCI device %s %d\n", dev.ioBundle.PciLong, dev.ioBundle.Type)
 		// read the size of the PCI device aperture. Only GPU/VGA devices for now
-		if dev.ioType != types.IoOther && dev.ioType != types.IoHDMI {
+		if dev.ioBundle.Type != types.IoOther && dev.ioBundle.Type != types.IoHDMI {
 			continue
 		}
 		// skip bridges
@@ -789,12 +789,12 @@ func mmioVMMOverhead(domainName string, aa *types.AssignableAdapters, domainAdap
 		if err != nil {
 			// do not treat as fatal error
 			logrus.Warnf("Can't read PCI device class, treat as bridge %s: %v\n",
-				dev.pciLong, err)
+				dev.ioBundle.PciLong, err)
 			isBridge = true
 		}
 
 		if isBridge {
-			logrus.Infof("Skipping bridge %s\n", dev.pciLong)
+			logrus.Infof("Skipping bridge %s\n", dev.ioBundle.PciLong)
 			continue
 		}
 
@@ -802,7 +802,7 @@ func mmioVMMOverhead(domainName string, aa *types.AssignableAdapters, domainAdap
 		resources, err := dev.readResources(sysfsPciDevices)
 		if err != nil {
 			return 0, logError("Can't read PCI device resources %s: %v\n",
-				dev.pciLong, err)
+				dev.ioBundle.PciLong, err)
 		}
 
 		// calculate the size of the MMIO region
@@ -977,6 +977,15 @@ func (ctx KvmContext) Setup(status types.DomainStatus, config types.DomainConfig
 	if config.MetaDataType == types.MetaDataOpenStack {
 		// we need to set product_name to support cloud-init
 		dmArgs = append(dmArgs, "-smbios", "type=1,product=OpenStack Compute")
+	}
+
+	if status.PassthroughWindowsLicenseKey {
+		if config.OemWindowsLicenseKeyInfo.Qemu.DomainArguments != nil {
+			dmArgs = append(dmArgs, config.OemWindowsLicenseKeyInfo.Qemu.DomainArguments...)
+		} else {
+			// this should never happen, but just in case.
+			return logError("Windows OEM license key is enabled but no domain arguments are provided")
+		}
 	}
 
 	os.MkdirAll(kvmStateDir+domainName, 0777)
@@ -1194,9 +1203,9 @@ func (a *pciAddressAllocator) allocate() error {
 			// Skip PCI address 0 which is unsupported for standard hotplug controller.
 			pciDeviceID := 1
 			devIndex := md.index(a.pciAssignments[i])
-			thisIsNetDev := a.pciAssignments[i].ioType.IsNet()
+			thisIsNetDev := a.pciAssignments[i].ioBundle.Type.IsNet()
 			for dev2Index, dev2 := range md.devs {
-				theOtherIsNetDev := dev2.ioType.IsNet()
+				theOtherIsNetDev := dev2.ioBundle.Type.IsNet()
 				if !thisIsNetDev {
 					if theOtherIsNetDev {
 						// Network functions take priority in the order.
@@ -1299,11 +1308,11 @@ func (pd pciDevicesWithBridge) index(p pciDevice) int {
 func (pd pciDevicesWithBridge) compareOrder(
 	pd2 pciDevicesWithBridge) (isBefore, isAfter bool) {
 	for _, dev := range pd.devs {
-		if !dev.ioType.IsNet() {
+		if !dev.ioBundle.Type.IsNet() {
 			continue
 		}
 		for _, dev2 := range pd2.devs {
-			if !dev2.ioType.IsNet() {
+			if !dev2.ioBundle.Type.IsNet() {
 				continue
 			}
 			if dev.netIntfOrder < dev2.netIntfOrder {
@@ -1326,7 +1335,7 @@ func (pd pciDevicesWithBridge) compareOrder(
 func (pd pciDevicesWithBridge) compareOrderWithVirtNet(
 	virtNet virtualNetwork) (isBefore, isAfter bool) {
 	for _, dev := range pd.devs {
-		if !dev.ioType.IsNet() {
+		if !dev.ioBundle.Type.IsNet() {
 			continue
 		}
 		if dev.netIntfOrder < virtNet.VifOrder {
@@ -1342,7 +1351,7 @@ func (pd pciDevicesWithBridge) compareOrderWithVirtNet(
 // Return true if device has at least one network function.
 func (pd pciDevicesWithBridge) hasNetworkFunction() bool {
 	for _, dev := range pd.devs {
-		if dev.ioType.IsNet() {
+		if dev.ioBundle.Type.IsNet() {
 			return true
 		}
 	}
@@ -1405,7 +1414,7 @@ func (f *pciAssignmentsTemplateFiller) do(pciAssignments []pciDevice) error {
 	pciEBridgeForMultiFuncDevCreated := make(map[string]struct{}) // key: pci long without function number
 	for _, pa := range pciAssignments {
 		pciPTContext := tQemuPCIPassthruContext{
-			PciShortAddr: types.PCILongToShort(pa.pciLong),
+			PciShortAddr: types.PCILongToShort(pa.ioBundle.PciLong),
 			Xvga:         pa.isVGA(),
 			Xopregion:    false,
 		}
@@ -1517,6 +1526,9 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 		isVncShimVMEnabled(globalConfig, config)
 	qemuConfContext.DomainConfig.DisplayName = domainName
 
+	// signal Qemu to inject MS Licenses via custom ACPI tables
+	qemuConfContext.DomainConfig.EnableOemWinLicenseKey = config.EnableOemWinLicenseKey
+
 	// render global device model settings
 	if err := tQemuGlobalConf.Execute(file, qemuConfContext); err != nil {
 		return logError("can't write to config file %s (%v)", file.Name(), err)
@@ -1583,7 +1595,8 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 			}
 			if ib.PciLong != "" && ib.UsbAddr == "" {
 				logrus.Infof("Adding PCI device <%v>\n", ib.PciLong)
-				tap := pciDevice{pciLong: ib.PciLong, ioType: ib.Type}
+				tap := pciDevice{ioBundle: *ib}
+
 				if ib.Type.IsNet() {
 					tap.netIntfOrder = adapter.IntfOrder
 				}
@@ -1635,7 +1648,8 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 	}
 	// Set pciDeviceID and pciBridgeID for every item in pciAssignments and virtualNetworks.
 	if err = addrAllocator.allocate(); err != nil {
-		return logError(err.Error())
+		logrus.Error(err.Error())
+		return err
 	}
 
 	// Render virtual network interfaces.
@@ -1644,7 +1658,8 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 	}
 	err = virtNetworksFiller.do(virtualNetworks, config.VirtualizationMode)
 	if err != nil {
-		return logError(err.Error())
+		logrus.Error(err.Error())
+		return err
 	}
 
 	// Render PCI assignments.
@@ -2006,4 +2021,50 @@ func requestvTPMTermination(id uuid.UUID, wp *types.WatchdogParam) error {
 	}
 
 	return nil
+}
+
+// OemWindowsLicenseKeySetup prepares the domain to receive Windows OEM license keys
+func (ctx KvmContext) OemWindowsLicenseKeySetup(wlk *types.OemWindowsLicenseKeyInfo) error {
+	licenses := getWindowsLicenseACPIPath()
+	for _, license := range licenses {
+		licenseFile := fmt.Sprintf("file=%s", license)
+		wlk.Qemu.DomainArguments = append(wlk.Qemu.DomainArguments, "-acpitable", licenseFile)
+	}
+
+	// add sysinfo
+	smbiosSysInfo := generateDmidecodeSmbiosString(wlk.SystemInfo)
+	wlk.Qemu.DomainArguments = append(wlk.Qemu.DomainArguments, "-smbios", smbiosSysInfo)
+
+	return nil
+}
+
+// generateDmidecodeSmbiosString creates the SMBIOS string from dmi info
+func generateDmidecodeSmbiosString(sysInfo types.DmiSystemInfo) string {
+	var fields []string
+
+	if sysInfo.UUID != "" {
+		fields = append(fields, fmt.Sprintf("uuid=%s", sysInfo.UUID))
+	}
+	if sysInfo.Manufacturer != "" {
+		fields = append(fields, fmt.Sprintf("manufacturer=%s", sysInfo.Manufacturer))
+	}
+	if sysInfo.ProductName != "" {
+		fields = append(fields, fmt.Sprintf("product=%s", sysInfo.ProductName))
+	}
+	if sysInfo.Version != "" {
+		fields = append(fields, fmt.Sprintf("version=%s", sysInfo.Version))
+	}
+	if sysInfo.SerialNumber != "" {
+		fields = append(fields, fmt.Sprintf("serial=%s", sysInfo.SerialNumber))
+	}
+	if sysInfo.SKUNumber != "" {
+		fields = append(fields, fmt.Sprintf("sku=%s", sysInfo.SKUNumber))
+	}
+	if sysInfo.Family != "" {
+		fields = append(fields, fmt.Sprintf("family=%s", sysInfo.Family))
+	}
+
+	smbiosString := "type=1," + strings.Join(fields, ",")
+	logrus.Infof("Generated SMBIOS string: %s", smbiosString)
+	return smbiosString
 }

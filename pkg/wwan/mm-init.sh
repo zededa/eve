@@ -14,7 +14,7 @@ enable_fcc_unlock() {
     if [ -f "$SCRIPT" ]; then
       SCRIPT_NAME="$(basename "$SCRIPT")"
       case "$SCRIPT_NAME" in
-        "1eac:1002" | "2c7c:030a" | "2c7c:0311")
+        "1eac:1002" | "2c7c:030a" | "2c7c:0311" | "105b:e0ab")
           # For these modems we have our own custom scripts.
           continue
           ;;
@@ -41,12 +41,11 @@ cp /lib/udev/rules.d/* /run/udev/rules.d/
 udevadm control --reload
 udevadm trigger
 
-echo "Starting Modem Manager"
+echo "Enabling FCC unlock scripts"
 enable_fcc_unlock
-ModemManager --debug &
 
 echo "Starting Modem Manager Agent"
-# Monitor liveness of the agent (and Modem Manager) with watchdog.
+# Monitor liveness of the agent with watchdog.
 mkdir -p /run/watchdog/file
 touch /run/watchdog/file/wwan.touch
 mmagent

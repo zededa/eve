@@ -12,13 +12,13 @@ import (
 	"github.com/eriknordmark/ipinfo"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/conntester"
+	"github.com/lf-edge/eve/pkg/pillar/controllerconn"
 	"github.com/lf-edge/eve/pkg/pillar/dpcreconciler"
 	"github.com/lf-edge/eve/pkg/pillar/flextimer"
 	"github.com/lf-edge/eve/pkg/pillar/netdump"
 	"github.com/lf-edge/eve/pkg/pillar/netmonitor"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	uuid "github.com/satori/go.uuid"
 )
 
@@ -74,6 +74,12 @@ type DpcManager struct {
 	// XXX Should we make this a global config parameter?
 	DpcMinTimeSinceFailure time.Duration
 
+	// Time limit for some DPC to become available.
+	// Once this elapses and no DPC has been provided, DPCManager will try lastresort.
+	// By default (if not specified), this is 1 minute.
+	// It is useful to override this for unit testing purposes.
+	DpcAvailTimeLimit time.Duration
+
 	// NIM components that the manager interacts with
 	NetworkMonitor netmonitor.NetworkMonitor
 	DpcReconciler  dpcreconciler.DpcReconciler
@@ -85,7 +91,7 @@ type DpcManager struct {
 	PubDeviceNetworkStatus   pubsub.Publication
 
 	// Metrics
-	ZedcloudMetrics *zedcloud.AgentMetrics
+	AgentMetrics *controllerconn.AgentMetrics
 
 	// Current configuration
 	dpcList          types.DevicePortConfigList
@@ -98,8 +104,15 @@ type DpcManager struct {
 	devUUID          uuid.UUID
 	flowlogEnabled   bool
 	clusterStatus    types.EdgeNodeClusterStatus
+	airGapMode       bool
+	locURL           string
+	kubeUserServices types.KubeUserServices
 	// Boot-time configuration
 	dpclPresentAtBoot bool
+
+	// Last-Resort DPC
+	expectBootstrapDPCs bool
+	lastResort          *types.DevicePortConfig
 
 	// DPC verification
 	dpcVerify dpcVerify
@@ -193,25 +206,29 @@ const (
 	commandProcessWwanStatus
 	commandUpdateFlowlogState
 	commandUpdateClusterStatus
+	commandUpdateLOCUrl
+	commandUpdateKubeUserServices
 )
 
 type inputCommand struct {
-	cmd            command
-	dpc            types.DevicePortConfig      // for commandAddDPC and commandDelDPC
-	gcp            types.ConfigItemValueMap    // for commandUpdateGCP
-	aa             types.AssignableAdapters    // for commandUpdateAA
-	rs             types.RadioSilence          // for commandUpdateRS
-	devUUID        uuid.UUID                   // for commandUpdateDevUUID
-	wwanStatus     types.WwanStatus            // for commandProcessWwanStatus
-	flowlogEnabled bool                        // for commandUpdateFlowlogState
-	clusterStatus  types.EdgeNodeClusterStatus // for commandUpdateClusterStatus
+	cmd              command
+	dpc              types.DevicePortConfig      // for commandAddDPC and commandDelDPC
+	gcp              types.ConfigItemValueMap    // for commandUpdateGCP
+	aa               types.AssignableAdapters    // for commandUpdateAA
+	rs               types.RadioSilence          // for commandUpdateRS
+	devUUID          uuid.UUID                   // for commandUpdateDevUUID
+	wwanStatus       types.WwanStatus            // for commandProcessWwanStatus
+	flowlogEnabled   bool                        // for commandUpdateFlowlogState
+	clusterStatus    types.EdgeNodeClusterStatus // for commandUpdateClusterStatus
+	locURL           string                      // for commandUpdateLOCUrl
+	kubeUserServices types.KubeUserServices      // for commandUpdateKubeUserServices
 }
 
 type dpcVerify struct {
-	inProgress     bool
-	startedAt      time.Time
-	cloudConnWorks bool
-	crucialIfs     map[string]netmonitor.IfAttrs // key = ifName, change triggers restartVerify
+	inProgress          bool
+	startedAt           time.Time
+	controllerConnWorks bool
+	crucialIfs          map[string]netmonitor.IfAttrs // key = ifName, change triggers restartVerify
 }
 
 // Init DpcManager
@@ -224,9 +241,12 @@ func (m *DpcManager) Init(ctx context.Context) error {
 	if m.DpcMinTimeSinceFailure == 0 {
 		m.DpcMinTimeSinceFailure = 5 * time.Minute
 	}
+	if m.DpcAvailTimeLimit == 0 {
+		m.DpcAvailTimeLimit = time.Minute
+	}
 	m.dpcList.CurrentIndex = -1
-	// We start assuming cloud connectivity works
-	m.dpcVerify.cloudConnWorks = true
+	// We start assuming controller connectivity works
+	m.dpcVerify.controllerConnWorks = true
 
 	// Keep timers inactive until we receive GCP.
 	m.dpcTestTimer = &time.Timer{}
@@ -241,9 +261,12 @@ func (m *DpcManager) Init(ctx context.Context) error {
 }
 
 // Run DpcManager as a separate task with its own loop and a watchdog file.
-func (m *DpcManager) Run(ctx context.Context) (err error) {
+// The expectBootstrapDPCs flag indicates whether initial DPCs for network bootstrapping
+// are expected to arrive shortly.
+func (m *DpcManager) Run(ctx context.Context, expectBootstrapDPCs bool) (err error) {
 	m.startTime = time.Now()
 	m.networkEvents = m.NetworkMonitor.WatchEvents(ctx, "dpc-reconciler")
+	m.expectBootstrapDPCs = expectBootstrapDPCs
 	go m.run(ctx)
 	return nil
 }
@@ -256,6 +279,25 @@ func (m *DpcManager) run(ctx context.Context) {
 
 	// Run initial reconciliation.
 	m.reconcileStatus = m.DpcReconciler.Reconcile(ctx, m.reconcilerArgs())
+
+	// Time limit for obtaining a valid network configuration.
+	// If this timer expires without any config being received, lastresort will be enabled
+	// unconditionally.
+	// This primarily handles cases where the device has lost
+	// /persist/status/nim/DevicePortConfigList.
+	//
+	// It can also be triggered if a bootstrapping DPC (e.g., override.json or bootstrap-config.pb)
+	// is present but invalid.
+	//
+	// In normal onboarding, with an initially empty DPCL, DPCManager either:
+	//   - Receives a bootstrapping DPC from nim, or
+	//   - If none is available (i.e., expectBootstrapDPCs set by nim is false), it creates
+	//     and tries lastresort DPC after receiving the global config (ConfigItemValueMap)
+	//     (see doUpdateGCP).
+	//
+	// This timer here is really just a fallback mechanism if something went wrong,
+	// to make sure we never end with empty DPCL.
+	dpcAvailTimer := time.After(m.DpcAvailTimeLimit)
 
 	for {
 		select {
@@ -281,6 +323,10 @@ func (m *DpcManager) run(ctx context.Context) {
 				m.doUpdateFlowlogState(ctx, inputCmd.flowlogEnabled)
 			case commandUpdateClusterStatus:
 				m.doUpdateClusterStatus(ctx, inputCmd.clusterStatus)
+			case commandUpdateLOCUrl:
+				m.doUpdateLOCUrl(ctx, inputCmd.locURL)
+			case commandUpdateKubeUserServices:
+				m.doUpdateKubeUserServices(ctx, inputCmd.kubeUserServices)
 			}
 			m.resumeVerifyIfAsyncDone(ctx)
 
@@ -288,23 +334,33 @@ func (m *DpcManager) run(ctx context.Context) {
 			m.reconcileStatus = m.DpcReconciler.Reconcile(ctx, m.reconcilerArgs())
 			m.resumeVerifyIfAsyncDone(ctx)
 
+		case <-dpcAvailTimer:
+			if len(m.dpcList.PortConfigList) == 0 {
+				// Add lastresort DPC even if it is disabled by config.
+				reason := fmt.Sprintf("DPC Manager has no network config to work with "+
+					"even after %v, enabling lastresort unconditionally",
+					m.DpcAvailTimeLimit)
+				m.Log.Notice(reason)
+				m.addOrUpdateLastResortDPC(ctx, reason)
+			}
+
 		case _, ok := <-m.dpcTestTimer.C:
 			start := time.Now()
 			if !ok {
 				m.Log.Noticef("DPC test timer stopped?")
 			} else if m.dpcList.CurrentIndex == -1 {
-				m.Log.Tracef("Starting looking for working Device connectivity to cloud")
+				m.Log.Tracef("Starting looking for working Device connectivity to controller")
 				m.restartVerify(ctx, "looking for working DPC")
 				m.Log.Noticef("Looking for working done at index %d. Took %v",
 					m.dpcList.CurrentIndex, time.Since(start))
 			} else {
-				m.Log.Tracef("Starting test of Device connectivity to cloud")
-				err := m.testConnectivityToCloud(ctx)
+				m.Log.Tracef("Starting test of Device connectivity to controller")
+				err := m.testConnectivityToController(ctx)
 				if err == nil {
-					m.Log.Tracef("Device connectivity to cloud worked. Took %v",
+					m.Log.Tracef("Device connectivity to controller worked. Took %v",
 						time.Since(start))
 				} else {
-					m.Log.Noticef("Device connectivity to cloud failed (%v). Took %v",
+					m.Log.Noticef("Device connectivity to controller failed (%v). Took %v",
 						err, time.Since(start))
 				}
 			}
@@ -348,6 +404,7 @@ func (m *DpcManager) run(ctx context.Context) {
 		case event := <-m.networkEvents:
 			switch ev := event.(type) {
 			case netmonitor.IfChange:
+				m.updateLastResortOnIntfChange(ctx, ev)
 				ifName := ev.Attrs.IfName
 				if !m.adapters.Initialized {
 					continue
@@ -413,11 +470,12 @@ func (m *DpcManager) run(ctx context.Context) {
 
 func (m *DpcManager) reconcilerArgs() dpcreconciler.Args {
 	args := dpcreconciler.Args{
-		GCP:            m.globalCfg,
-		AA:             m.adapters,
-		RS:             m.rsConfig,
-		FlowlogEnabled: m.flowlogEnabled,
-		ClusterStatus:  m.clusterStatus,
+		GCP:              m.globalCfg,
+		AA:               m.adapters,
+		RS:               m.rsConfig,
+		FlowlogEnabled:   m.flowlogEnabled,
+		ClusterStatus:    m.clusterStatus,
+		KubeUserServices: m.kubeUserServices,
 	}
 	if m.currentDPC() != nil {
 		args.DPC = *m.currentDPC()
@@ -505,6 +563,22 @@ func (m *DpcManager) UpdateClusterStatus(status types.EdgeNodeClusterStatus) {
 	}
 }
 
+// UpdateLOCUrl : apply an updated LOC URL.
+func (m *DpcManager) UpdateLOCUrl(locURL string) {
+	m.inputCommands <- inputCommand{
+		cmd:    commandUpdateLOCUrl,
+		locURL: locURL,
+	}
+}
+
+// UpdateKubeUserServices : apply an updated Kubernetes user services data.
+func (m *DpcManager) UpdateKubeUserServices(services types.KubeUserServices) {
+	m.inputCommands <- inputCommand{
+		cmd:              commandUpdateKubeUserServices,
+		kubeUserServices: services,
+	}
+}
+
 // GetDNS returns device network state information.
 func (m *DpcManager) GetDNS() types.DeviceNetworkStatus {
 	return m.deviceNetStatus
@@ -528,8 +602,8 @@ func (m *DpcManager) doUpdateGCP(ctx context.Context, gcp types.ConfigItemValueM
 	geoRetryInterval := time.Second *
 		time.Duration(m.globalCfg.GlobalValueInt(types.NetworkGeoRetryTime))
 
-	fallbackAnyEth := m.globalCfg.GlobalValueTriState(types.NetworkFallbackAnyEth)
-	m.enableLastResort = fallbackAnyEth == types.TS_ENABLED
+	airGapModeState := m.globalCfg.GlobalValueTriState(types.AirGapMode)
+	m.airGapMode = airGapModeState == types.TS_ENABLED
 
 	if m.dpcTestInterval != testInterval {
 		if testInterval == 0 {
@@ -574,6 +648,31 @@ func (m *DpcManager) doUpdateGCP(ctx context.Context, gcp types.ConfigItemValueM
 	m.reinitNetdumper()
 
 	m.reconcileStatus = m.DpcReconciler.Reconcile(ctx, m.reconcilerArgs())
+
+	// Handle NetworkFallbackAnyEth config property.
+	wasLastResortEnabled := m.enableLastResort
+	fallbackAnyEth := m.globalCfg.GlobalValueTriState(types.NetworkFallbackAnyEth)
+	m.enableLastResort = fallbackAnyEth == types.TS_ENABLED
+	if m.enableLastResort && !wasLastResortEnabled {
+		m.addOrUpdateLastResortDPC(ctx, "lastresort enabled by global config")
+	}
+	if !m.enableLastResort && wasLastResortEnabled {
+		m.compressAndPublishDPCL()
+	}
+	if firstGCP && !m.enableLastResort {
+		// Even if the lastresort DPC is disabled by config, it can be forcefully enabled
+		// until DPCManager receives a valid network configuration (from the controller,
+		// bootstrap, override, or USB).
+		//
+		// Specifically, if no DPC is persisted from a previous run (e.g., during the first
+		// device boot or after /persist is lost due to disk replacement or wiping),
+		// and if no bootstrap DPC is expected to arrive shortly, then use the lastresort
+		// DPC as a fallback to attempt establishing the initial connectivity.
+		if len(m.dpcList.PortConfigList) == 0 && !m.expectBootstrapDPCs {
+			m.addOrUpdateLastResortDPC(ctx, "no DPC available for bootstrapping")
+		}
+	}
+
 	// If we have persisted DPCs then go ahead and pick a working one
 	// with the highest priority, do not wait for dpcTestTimer to fire.
 	if firstGCP && m.currentDPC() == nil && len(m.dpcList.PortConfigList) > 0 {
@@ -583,6 +682,10 @@ func (m *DpcManager) doUpdateGCP(ctx context.Context, gcp types.ConfigItemValueM
 
 func (m *DpcManager) doUpdateAA(ctx context.Context, adapters types.AssignableAdapters) {
 	m.adapters = adapters
+	if m.lastResort != nil {
+		m.addOrUpdateLastResortDPC(ctx, "assignable adapters changed")
+	}
+
 	// In case a verification is in progress and is waiting for return from pciback
 	if dpc := m.currentDPC(); dpc != nil {
 		if dpc.State == types.DPCStatePCIWait || dpc.State == types.DPCStateIntfWait {
@@ -647,5 +750,17 @@ func (m *DpcManager) doUpdateFlowlogState(ctx context.Context, flowlogEnabled bo
 func (m *DpcManager) doUpdateClusterStatus(ctx context.Context,
 	status types.EdgeNodeClusterStatus) {
 	m.clusterStatus = status
+	m.reconcileStatus = m.DpcReconciler.Reconcile(ctx, m.reconcilerArgs())
+}
+
+func (m *DpcManager) doUpdateLOCUrl(ctx context.Context, locURL string) {
+	m.locURL = locURL
+	// Nothing else to do here.
+	// Updated LOC URL will take effect in the next connectivity testing.
+}
+
+func (m *DpcManager) doUpdateKubeUserServices(ctx context.Context,
+	services types.KubeUserServices) {
+	m.kubeUserServices = services
 	m.reconcileStatus = m.DpcReconciler.Reconcile(ctx, m.reconcilerArgs())
 }

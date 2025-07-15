@@ -16,6 +16,8 @@ type VaultStatus struct {
 	Status             info.DataSecAtRestStatus
 	PCRStatus          info.PCRStatus
 	ConversionComplete bool
+	// only valid if TPM is enabled and Sealed key is used
+	MismatchingPCRs []int
 	// ErrorAndTime provides SetErrorNow() and ClearError()
 	ErrorAndTime
 }
@@ -174,4 +176,9 @@ func (key EncryptedVaultKeyFromController) LogDelete(logBase *base.LogObject) {
 // LogKey :
 func (key EncryptedVaultKeyFromController) LogKey() string {
 	return string(base.EncryptedVaultKeyFromControllerLogType) + "-" + key.Key()
+}
+
+// IsVaultInError :
+func (status VaultStatus) IsVaultInError() bool {
+	return (status.Status == info.DataSecAtRestStatus_DATASEC_AT_REST_ERROR) && len(status.MismatchingPCRs) > 0
 }

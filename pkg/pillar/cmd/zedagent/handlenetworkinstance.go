@@ -14,8 +14,8 @@ import (
 	"github.com/lf-edge/eve-api/go/flowlog"
 	zinfo "github.com/lf-edge/eve-api/go/info"   // XXX need to stop using
 	zmet "github.com/lf-edge/eve-api/go/metrics" // zinfo and zmet here
+	"github.com/lf-edge/eve/pkg/pillar/controllerconn"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -194,12 +194,11 @@ func prepareAndPublishNetworkInstanceInfoMsg(ctx *zedagentContext,
 	if buf == nil {
 		log.Fatal("malloc error")
 	}
-	size := int64(proto.Size(infoMsg))
 
 	//We queue the message and then get the highest priority message to send.
 	//If there are no failures and defers we'll send this message,
 	//but if there is a queue we'll retry sending the highest priority message.
-	queueInfoToDest(ctx, dest, uuid, buf, size, true, false, false,
+	queueInfoToDest(ctx, dest, uuid, buf, true, false, false,
 		zinfo.ZInfoTypes_ZiNetworkInstance)
 }
 
@@ -354,7 +353,8 @@ func flowlogTask(ctx *zedagentContext, flowlogQueue <-chan *flowlog.FlowMessage)
 		start := time.Now()
 		log.Function("flowlogTask got message")
 		var retry bool
-		err := publishFlowMessage(msg, iteration)
+		expectNoConn := ctx.airgapMode
+		err := publishFlowMessage(msg, iteration, expectNoConn)
 		if err == nil {
 			iteration++
 			ctx.flowLogMetrics.Lock()
@@ -363,7 +363,9 @@ func flowlogTask(ctx *zedagentContext, flowlogQueue <-chan *flowlog.FlowMessage)
 			ctx.flowLogMetrics.DNSReqs.Success += uint64(len(msg.DnsReqs))
 			ctx.flowLogMetrics.Unlock()
 		} else {
-			log.Error(err)
+			if !expectNoConn {
+				log.Error(err)
+			}
 			ctx.flowLogMetrics.Lock()
 			ctx.flowLogMetrics.Messages.FailedAttempts++
 			ctx.flowLogMetrics.Flows.FailedAttempts += uint64(len(msg.Flows))
@@ -422,22 +424,25 @@ func flowlogTask(ctx *zedagentContext, flowlogQueue <-chan *flowlog.FlowMessage)
 	}
 }
 
-func publishFlowMessage(flowMsg *flowlog.FlowMessage, iteration int) error {
+func publishFlowMessage(flowMsg *flowlog.FlowMessage, iteration int, expectNoConn bool) error {
 	data, err := proto.Marshal(flowMsg)
 	if err != nil {
 		err = fmt.Errorf("publishFlowMessage: proto marshaling error %w", err)
 		return err
 	}
 	buf := bytes.NewBuffer(data)
-	size := int64(proto.Size(flowMsg))
 
-	flowlogURL := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, devUUID, "flowlog")
-	const bailOnHTTPErr = false
-	const withNetTrace = false
-	ctxWork, cancel := zedcloud.GetContextForAllIntfFunctions(zedcloudCtx)
+	flowlogURL := controllerconn.URLPathString(
+		serverNameAndPort, ctrlClient.UsingV2API(), devUUID, "flowlog")
+	ctxWork, cancel := ctrlClient.GetContextForAllIntfFunctions()
 	defer cancel()
-	rv, err := zedcloud.SendOnAllIntf(ctxWork, zedcloudCtx, flowlogURL,
-		size, buf, iteration, bailOnHTTPErr, withNetTrace)
+	rv, err := ctrlClient.SendOnAllIntf(ctxWork, flowlogURL, buf,
+		controllerconn.RequestOptions{
+			WithNetTracing: false,
+			BailOnHTTPErr:  false,
+			Iteration:      iteration,
+			SuppressLogs:   expectNoConn,
+		})
 	if err != nil {
 		err = fmt.Errorf("publishFlowMessage: SendOnAllIntf failed with %d: %s",
 			rv.Status, err)

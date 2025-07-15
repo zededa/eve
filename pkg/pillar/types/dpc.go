@@ -370,12 +370,12 @@ func (config *DevicePortConfig) DoSanitize(log *base.LogObject, args DPCSanitize
 			port := &config.Ports[i]
 			if port.Phylabel == "" {
 				port.Phylabel = port.IfName
-				log.Functionf("XXX DoSanitize: Forcing Phylabel for %s ifname %s\n",
+				log.Functionf("DoSanitize: Setting missing Phylabel to match ifname for %s ifname %s",
 					config.Key, port.IfName)
 			}
 			if port.Logicallabel == "" {
 				port.Logicallabel = port.IfName
-				log.Functionf("XXX DoSanitize: Forcing Logicallabel for %s ifname %s\n",
+				log.Functionf("DoSanitize: Setting missing Logicallabel to match ifname for %s ifname %s",
 					config.Key, port.IfName)
 			}
 		}
@@ -517,8 +517,8 @@ func (config DevicePortConfig) WasDPCWorking() bool {
 // the port was not tested, so we retain the original TestResults for the port.
 func (config *DevicePortConfig) UpdatePortStatusFromIntfStatusMap(
 	intfStatusMap IntfStatusMap) {
-	for indx := range config.Ports {
-		portPtr := &config.Ports[indx]
+	for index := range config.Ports {
+		portPtr := &config.Ports[index]
 		tr, ok := intfStatusMap.StatusMap[portPtr.IfName]
 		if ok {
 			portPtr.TestResults.Update(tr)
@@ -791,6 +791,15 @@ type WifiConfig struct {
 	CipherBlockStatus
 }
 
+const (
+	// WpaFilename : path to WiFi wpa_supplicant file.
+	WpaFilename = "/run/wlan/wpa_supplicant.conf"
+	// RunWlanDir : directory for WLAN-related configuration.
+	RunWlanDir = "/run/wlan"
+	// WpaTempname : name used for a temporary wpa_supplicant file.
+	WpaTempname = "wpa_supplicant.temp"
+)
+
 // DeprecatedCellConfig : old and now deprecated structure for storing cellular
 // network port config. It is preserved only to support upgrades from older EVE
 // versions where this is still being used (under the original struct name "CellConfig")
@@ -822,11 +831,14 @@ type CellularAccessPoint struct {
 	SIMSlot uint8
 	// If true, then this configuration is currently activated.
 	Activated bool
-	// Access Point Network
+	// Access Point Network for the default bearer.
 	APN string
-	// Authentication protocol used by the network.
+	// The IP addressing type to use for the default bearer.
+	IPType WwanIPType
+	// Authentication protocol used for the default bearer.
 	AuthProtocol WwanAuthProtocol
-	// EncryptedCredentials : encrypted username and password.
+	// Encrypted user credentials for the default bearer and/or the attach bearer
+	// (when required).
 	EncryptedCredentials CipherBlockStatus
 	// The set of cellular network operators that modem should preferably try to register
 	// and connect into.
@@ -837,28 +849,32 @@ type CellularAccessPoint struct {
 	PreferredRATs []WwanRAT
 	// If true, then modem will avoid connecting to networks with roaming.
 	ForbidRoaming bool
+	// Access Point Network for the attach (aka initial) bearer.
+	AttachAPN string
+	// The IP addressing type to use for the attach bearer.
+	AttachIPType WwanIPType
+	// Authentication protocol used for the attach bearer.
+	AttachAuthProtocol WwanAuthProtocol
 }
 
 // Equal compares two instances of CellularAccessPoint for equality.
 func (ap CellularAccessPoint) Equal(ap2 CellularAccessPoint) bool {
 	if ap.SIMSlot != ap2.SIMSlot ||
 		ap.Activated != ap2.Activated ||
-		ap.APN != ap2.APN {
-		return false
-	}
-	enc1 := ap.EncryptedCredentials
-	enc2 := ap2.EncryptedCredentials
-	if ap.AuthProtocol != ap2.AuthProtocol ||
-		enc1.CipherBlockID != enc2.CipherBlockID ||
-		enc1.CipherContextID != enc2.CipherContextID ||
-		!bytes.Equal(enc1.InitialValue, enc2.InitialValue) ||
-		!bytes.Equal(enc1.CipherData, enc2.CipherData) ||
-		!bytes.Equal(enc1.ClearTextHash, enc2.ClearTextHash) {
+		ap.APN != ap2.APN ||
+		ap.IPType != ap2.IPType ||
+		ap.AuthProtocol != ap2.AuthProtocol ||
+		!ap.EncryptedCredentials.Equal(ap2.EncryptedCredentials) {
 		return false
 	}
 	if !generics.EqualLists(ap.PreferredPLMNs, ap2.PreferredPLMNs) ||
 		!generics.EqualLists(ap.PreferredRATs, ap2.PreferredRATs) ||
 		ap.ForbidRoaming != ap2.ForbidRoaming {
+		return false
+	}
+	if ap.AttachAPN != ap2.AttachAPN ||
+		ap.AttachIPType != ap2.AttachIPType ||
+		ap.AttachAuthProtocol != ap2.AttachAuthProtocol {
 		return false
 	}
 	return true

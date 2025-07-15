@@ -59,8 +59,8 @@ func (c Dhcpcd) Equal(other depgraph.Item) bool {
 	// Consider two DHCP configs as equal if they result in the same set of arguments for dhcpcd.
 	// This avoids unnecessary restarts of dhcpcd (when e.g. going from override to zedagent DPC).
 	configurator := &DhcpcdConfigurator{}
-	op1, args1 := configurator.dhcpcdArgs(c.DhcpConfig)
-	op2, args2 := configurator.dhcpcdArgs(c2.DhcpConfig)
+	op1, args1 := configurator.DhcpcdArgs(c.DhcpConfig)
+	op2, args2 := configurator.DhcpcdArgs(c2.DhcpConfig)
 	if op1 != op2 || len(args1) != len(args2) {
 		return false
 	}
@@ -151,10 +151,10 @@ func (c *DhcpcdConfigurator) Create(ctx context.Context, item depgraph.Item) err
 		}
 
 		// Prepare input arguments for dhcpcd.
-		op, args := c.dhcpcdArgs(config)
+		op, args := c.DhcpcdArgs(config)
 
 		// Start DHCP client.
-		if c.dhcpcdExists(client.AdapterIfName) {
+		if c.dhcpcdExists(client.AdapterIfName, config.Type) {
 			err := fmt.Errorf("dhcpcd for interface %s is already running", ifName)
 			c.Log.Error(err)
 			done(err)
@@ -168,7 +168,7 @@ func (c *DhcpcdConfigurator) Create(ctx context.Context, item depgraph.Item) err
 			return
 		}
 		// Wait for a bit then give up
-		for !c.dhcpcdExists(ifName) {
+		for !c.dhcpcdExists(ifName, config.Type) {
 			if time.Since(startTime) > dhcpcdStartTimeout {
 				err := fmt.Errorf("dhcpcd for interface %s failed to start in time",
 					ifName)
@@ -220,7 +220,7 @@ func (c *DhcpcdConfigurator) Delete(ctx context.Context, item depgraph.Item) err
 					c.Log.Errorf("dhcpcd release failed for interface %s: %v, elapsed time %v",
 						ifName, err, time.Since(startTime))
 				}
-				if !c.dhcpcdExists(ifName) {
+				if !c.dhcpcdExists(ifName, config.Type) {
 					break
 				}
 				if time.Since(startTime) > dhcpcdStopTimeout {
@@ -248,7 +248,7 @@ func (c *DhcpcdConfigurator) Delete(ctx context.Context, item depgraph.Item) err
 				done(err)
 				return
 			}
-			if !c.dhcpcdExists(ifName) {
+			if !c.dhcpcdExists(ifName, config.Type) {
 				c.Log.Noticef("dhcpcd for interface %s is gone after exit, elapsed time %v",
 					ifName, time.Since(startTime))
 				done(nil)
@@ -275,7 +275,9 @@ func (c *DhcpcdConfigurator) NeedsRecreate(oldItem, newItem depgraph.Item) (recr
 	return true
 }
 
-func (c *DhcpcdConfigurator) dhcpcdArgs(config types.DhcpConfig) (op string, args []string) {
+// DhcpcdArgs returns command line arguments for dhcpcd corresponding to the given
+// DHCP config. The method is exported only for the purpose of unit testing.
+func (c *DhcpcdConfigurator) DhcpcdArgs(config types.DhcpConfig) (op string, args []string) {
 	switch config.Dhcp {
 	case types.DhcpTypeClient:
 		op = "--request"
@@ -327,9 +329,9 @@ func (c *DhcpcdConfigurator) dhcpcdArgs(config types.DhcpConfig) (op string, arg
 		if config.NTPServers != nil {
 			for _, ntpServer := range config.NTPServers {
 				args = append(args, "--static", fmt.Sprintf("ntp_servers=%s", ntpServer))
-				args = append(args, extras...)
 			}
 		}
+		args = append(args, extras...)
 	}
 
 	return op, args
@@ -363,9 +365,19 @@ func (c *DhcpcdConfigurator) dhcpcdCmd(op string, extras []string,
 	return nil
 }
 
-func (c *DhcpcdConfigurator) dhcpcdExists(ifName string) bool {
+func (c *DhcpcdConfigurator) dhcpcdExists(ifName string, netType types.NetworkType) bool {
 	name := "/sbin/dhcpcd"
-	args := []string{"-P", ifName}
+	args := []string{"-P"}
+	// For --ipv4only and --ipv6only, dhcpcd adds PID filename suffix "-4" and "-6", respectively.
+	// "dhcpcd -P" therefore needs to know if these arguments are used to return the correct
+	// PID file name.
+	switch netType {
+	case types.NetworkTypeIpv4Only:
+		args = append(args, "--ipv4only")
+	case types.NetworkTypeIpv6Only:
+		args = append(args, "--ipv6only")
+	}
+	args = append(args, ifName)
 	out, err := base.Exec(c.Log, name, args...).CombinedOutput()
 	if err != nil {
 		err = fmt.Errorf("dhcpcd command %s failed: %w; output: %s",

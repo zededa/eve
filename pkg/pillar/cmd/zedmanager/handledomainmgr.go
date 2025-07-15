@@ -61,9 +61,12 @@ func MaybeAddDomainConfig(ctx *zedmanagerContext,
 		MetaDataType:      aiConfig.MetaDataType,
 		Service:           aiConfig.Service,
 		CloudInitVersion:  aiConfig.CloudInitVersion,
+		DisableLogs:       aiConfig.DisableLogs,
 		// This isDNiDnode will be set to true even if the App is not in cluster mode,
 		// This will be set in zedagent parseConfig for the case of single node/device App case.
 		IsDNidNode: aiConfig.IsDesignatedNodeID,
+		// DeploymentType is set to the value of the DeploymentType of the AppInstanceConfig
+		DeploymentType: aiConfig.DeploymentType,
 	}
 
 	dc.DiskConfigList = make([]types.DiskConfig, 0, len(aiStatus.VolumeRefStatusList))
@@ -99,7 +102,12 @@ func MaybeAddDomainConfig(ctx *zedmanagerContext,
 		// Reference name can be empty for non-kubevirt eve and KubeImageName will be ignored in such cases.
 		if aiConfig.FixedResources.VirtualizationMode == types.NOHYPER {
 			dc.VirtualizationMode = types.NOHYPER
-			dc.KubeImageName = vrs.ReferenceName
+			// App may have a second disk passed in which is an
+			// empty persistent disk.  Don't overwrite the DomainConfig
+			// KubeImageName if the last container os disk set it.
+			if dc.KubeImageName == "" {
+				dc.KubeImageName = vrs.ReferenceName
+			}
 		}
 	}
 	// let's fill some of the default values (arguably we may want controller

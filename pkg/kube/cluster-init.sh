@@ -3,8 +3,6 @@
 # Copyright (c) 2023-2024 Zededa, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-KUBEVIRT_VERSION=v1.1.0
-CDI_VERSION=v1.57.1
 NODE_IP=""
 RESTART_COUNT=0
 K3S_LOG_DIR="/persist/kubelog"
@@ -22,6 +20,9 @@ MAX_WAIT_TIME=$((10 * 60)) # 10 minutes in seconds, exponential backoff for k3s 
 current_wait_time=$INITIAL_WAIT_TIME
 CLUSTER_WAIT_FILE="/run/kube/cluster-change-wait-ongoing"
 All_PODS_READY=true
+install_kubevirt=1
+TRANSITION_PIPE="/tmp/cluster_transition_pipe$$"
+TRANSITION_FLAG_FILE="/tmp/cluster_transition_flag"
 
 # shellcheck source=pkg/kube/descheduler-utils.sh
 . /usr/bin/descheduler-utils.sh
@@ -32,6 +33,12 @@ All_PODS_READY=true
 . /usr/bin/cluster-utils.sh
 # shellcheck source=pkg/kube/cluster-update.sh
 . /usr/bin/cluster-update.sh
+# shellcheck source=pkg/kube/registration-utils.sh
+. /usr/bin/registration-utils.sh
+# shellcheck source=pkg/kube/utils.sh
+. /usr/bin/utils.sh
+# shellcheck source=pkg/kube/kubevirt-utils.sh
+. /usr/bin/kubevirt-utils.sh
 
 # get cluster IP address from the cluster status file
 get_cluster_node_ip() {
@@ -202,6 +209,18 @@ config_cluster_roles() {
 }
 
 check_start_k3s() {
+  # If cluster is in transition, wait until transition is complete
+  if [ -f "$TRANSITION_FLAG_FILE" ]; then
+    logmsg "Cluster transition in progress, waiting before starting k3s"
+
+    # This will block until something is written to the pipe
+    read -r _ < "$TRANSITION_PIPE"
+
+    # Clean up the pipe
+    rm -f "$TRANSITION_PIPE"
+    logmsg "Cluster transition completed, proceeding with k3s check"
+  fi
+
   # the cluster change code is in another task loop, so if the cluster wait is nogoing
   # don't go to start k3s in this time. wait also
   if [ -f "$CLUSTER_WAIT_FILE" ]; then
@@ -211,7 +230,7 @@ check_start_k3s() {
         done
   fi
 
-  pgrep -f "k3s server" > /dev/null 2>&1
+  pgrep -f "$K3S_SERVER_CMD" > /dev/null 2>&1
   if [ $? -eq 1 ]; then
         # do exponential backoff for k3s restart, but not more than MAX_WAIT_TIME
         RESTART_COUNT=$((RESTART_COUNT+1))
@@ -259,6 +278,10 @@ check_start_k3s() {
 }
 
 external_boot_image_import() {
+        if [ "$install_kubevirt" = "0" ]; then
+                return 0
+        fi
+
         # NOTE: https://kubevirt.io/user-guide/virtual_machines/boot_from_external_source/
         # Install external-boot-image image to our eve user containerd registry.
         # This image contains just kernel and initrd to bootstrap a container image as a VM.
@@ -326,6 +349,14 @@ apply_node_uuid_label () {
                 logmsg "Not all pods are ready, Continue to wait while applying node labels"
         fi
         kubectl label node "$HOSTNAME" node-uuid="$DEVUUID"
+}
+
+node_uuid_label_set() {
+        val=$(kubectl get "node/${HOSTNAME}" -o jsonpath='{.metadata.labels.node-uuid}')
+        if [ "$val" != "$DEVUUID" ]; then
+                return 1
+        fi
+        return 0
 }
 
 # reapply the node labels
@@ -520,6 +551,8 @@ check_cluster_config_change() {
           logmsg "EdgeNodeClusterConfig file found, but the EdgeNodeClusterStatus file is missing, wait..."
           return 0
         fi
+        Registration_Cleanup
+        rm /var/lib/left_edge_node_cluster_mode
         touch /var/lib/convert-to-single-node
         reboot
       fi
@@ -549,7 +582,10 @@ check_cluster_config_change() {
             # need to reapply node labels later
             rm /var/lib/node-labels-initialized
 
-            # kill the process and let the loop to restart k3s
+            mkfifo "$TRANSITION_PIPE"
+            touch "$TRANSITION_FLAG_FILE"
+
+            # restart k3s will run only if we are ready after the transition configs set
             terminate_k3s
             # romove the /var/lib/rancher/k3s/server/tls directory files
             if [ "$is_bootstrap" = "false" ]; then
@@ -561,7 +597,10 @@ check_cluster_config_change() {
             logmsg "provision config file for node to cluster mode"
             provision_cluster_config_file true
 
-            logmsg "WARNING: changing the node to cluster mode, done"
+            ## Allow the k3s loop to restart k3s
+            echo "DONE" > "$TRANSITION_PIPE"  # Signal completion
+            rm -f "$TRANSITION_FLAG_FILE"
+            logmsg "WARNING: changing the node to cluster mode, k3s can restart"
             break
           else
             sleep 10
@@ -572,13 +611,62 @@ check_cluster_config_change() {
       fi
     fi
     logmsg "Check cluster config change done"
+
+    ## Convert system
+    Registration_CheckApply
+    if Registration_Exists; then
+        if [ ! -f /var/lib/left_edge_node_cluster_mode ]; then
+                uninstall_components &
+                touch /var/lib/left_edge_node_cluster_mode
+        fi
+    fi
 }
 
 monitor_cluster_config_change() {
+    rm -f "$TRANSITION_FLAG_FILE"
     while true; do
         check_cluster_config_change
         sleep 15
     done
+}
+
+# started when we detect registration addition
+# start cleaning up some components
+# these are cluster-wide operations, only one nodes initiates it
+# Marked via the Registration_Exists fence
+uninstall_components() {
+        logmsg "Post-registration cleanup steps: wait api available"
+        while ! kubectl cluster-info; do
+                sleep 5
+        done
+        logmsg "Post-registration cleanup steps: kubectl cluster-info ready, wait nodes ready"
+        while true; do
+                # shellcheck disable=SC2281,SC2154,SC2046,SC2016
+                $not_ready_nodes=$(kubectl get nodes -o go-template='{{range .items}}{{ $ready := false }}{{range .status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}{{ $ready = true }}{{end}}{{end}}{{if not $ready}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}')
+                if [ "$not_ready_nodes" = "" ]; then
+                        break
+                fi
+                sleep 5
+        done
+        logmsg "Post-registration cleanup steps: nodes ready"
+
+        logmsg "Cleanup Descheduler"
+        Descheduler_uninstall
+
+        logmsg "Cleanup longhorn"
+        Longhorn_uninstall
+        rm /var/lib/longhorn_initialized
+
+        logmsg "Cleanup cdi"
+        Cdi_uninstall
+
+        logmsg "Cleanup kubevirt"
+        Kubevirt_uninstall
+        rm /var/lib/kubevirt_initialized
+
+        logmsg "Cleanup multus"
+        Multus_uninstall
+        rm /var/lib/multus_initialized
 }
 
 # provision the config.yaml and bootstrap-config.yaml for cluster node, passing $1 as k3s needs initializing
@@ -742,11 +830,17 @@ fi
 # use part of the /run/eve-release to get the OS-IMAGE string
 get_eve_os_release
 
+if ! is_amd64; then
+        # no cdi support yet
+        install_kubevirt=0
+fi
+
 #Forever loop every 15 secs
 while true;
 do
 if [ ! -f /var/lib/all_components_initialized ]; then
         if ! check_start_k3s; then
+                sleep 5  # Ensure minimum sleep time before retrying
                 continue
         fi
 
@@ -771,7 +865,9 @@ if [ ! -f /var/lib/all_components_initialized ]; then
         fi
 
         # label the node with device uuid
-        apply_node_uuid_label
+        if ! node_uuid_label_set; then
+                apply_node_uuid_label
+        fi
 
         if ! are_all_pods_ready; then
                 All_PODS_READY=false
@@ -807,27 +903,17 @@ if [ ! -f /var/lib/all_components_initialized ]; then
                 continue
         fi
 
-        if [ ! -f /var/lib/kubevirt_initialized ]; then
-                wait_for_item "kubevirt"
-                # This patched version will be removed once the following PR https://github.com/kubevirt/kubevirt/pull/9668 is merged
-                logmsg "Installing patched Kubevirt"
-                kubectl apply -f /etc/kubevirt-operator.yaml
-                logmsg "Updating replica to 1 for virt-operator and virt-controller"
-                kubectl patch deployment virt-operator -n kubevirt --patch '{"spec":{"replicas": 1 }}'
-                kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-cr.yaml
-                kubectl patch KubeVirt kubevirt -n kubevirt --patch '{"spec": {"infra": {"replicas": 1}}}' --type='merge'
+        if [ "$install_kubevirt" = "1" ]; then
+                if [ ! -f /var/lib/kubevirt_initialized ]; then
+                        wait_for_item "kubevirt"
+                        Kubevirt_install
 
-                wait_for_item "cdi"
-                #CDI (containerzed data importer) is need to convert qcow2/raw formats to Persistent Volumes and Data volumes
-                #Since CDI goes with kubevirt we install with that.
-                logmsg "Installing CDI version $CDI_VERSION"
-                kubectl create -f https://github.com/kubevirt/containerized-data-importer/releases/download/$CDI_VERSION/cdi-operator.yaml
-                kubectl create -f https://github.com/kubevirt/containerized-data-importer/releases/download/$CDI_VERSION/cdi-cr.yaml
-                #Add kubevirt feature gates
-                kubectl apply -f /etc/kubevirt-features.yaml
+                        wait_for_item "cdi"
+                        Cdi_install
 
-                touch /var/lib/kubevirt_initialized
-                continue
+                        touch /var/lib/kubevirt_initialized
+                        continue
+                fi
         fi
 
         #
@@ -850,12 +936,13 @@ if [ ! -f /var/lib/all_components_initialized ]; then
         # Descheduler
         #
         wait_for_item "descheduler"
+        logmsg "Applying Descheduler ${DESCHEDULER_VERSION}"
         if ! descheduler_install; then
                 continue
         fi
 
 
-        if [ -f /var/lib/kubevirt_initialized ] && [ -f /var/lib/longhorn_initialized ]; then
+        if [ -f /var/lib/longhorn_initialized ]; then
                 logmsg "All components initialized"
                 touch /var/lib/node-labels-initialized
                 touch /var/lib/all_components_initialized
@@ -874,7 +961,7 @@ else
                     node_count_ready=$(kubectl get "node/${HOSTNAME}" | grep -cw Ready )
                     if [ "$node_count_ready" -ne 1 ]; then
                         sleep 10
-                        pgrep -f "k3s server" > /dev/null 2>&1
+                        pgrep -f "$K3S_SERVER_CMD" > /dev/null 2>&1
                         if [ $? -eq 1 ]; then
                             break
                         fi
@@ -891,6 +978,10 @@ else
                 if [ ! -f /var/lib/node-labels-initialized ]; then
                         reapply_node_labels
                 fi
+                if ! external_boot_image_import; then
+                        continue
+                fi
+
                 # Initialize CNI after k3s reboot
                 if [ ! -d /var/lib/cni/bin ] || [ ! -d /opt/cni/bin ]; then
                         copy_cni_plugin_files
@@ -935,8 +1026,11 @@ fi
         check_kubeconfig_yaml_files
         check_and_remove_excessive_k3s_logs
         check_and_run_vnc
-        Update_CheckClusterComponents
-        Update_RunDeschedulerOnBoot
+        if ! Registration_Applied; then
+                # Upgrades declared via EVE baseOS updates
+                Update_CheckClusterComponents
+                Update_RunDeschedulerOnBoot
+        fi
         wait_for_item "wait"
         sleep 15
 done

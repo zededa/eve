@@ -14,7 +14,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	dg "github.com/lf-edge/eve-libs/depgraph"
-	"github.com/lf-edge/eve/pkg/pillar/devicenetwork"
 	"github.com/lf-edge/eve/pkg/pillar/iptables"
 	"github.com/lf-edge/eve/pkg/pillar/netmonitor"
 	generic "github.com/lf-edge/eve/pkg/pillar/nireconciler/genericitems"
@@ -368,9 +367,11 @@ func (r *LinuxNIReconciler) getIntendedGlobalState() dg.Graph {
 
 func (r *LinuxNIReconciler) getIntendedHostSysctl() linux.Sysctl {
 	var bridgeCallIptables, bridgeCallIp6tables bool
-	if r.withFlowlog() {
+	if r.withKubernetesNetworking || r.withFlowlog() {
 		// Enforce the use of iptables in order to get conntrack entry
 		// created for every flow, which is then used to obtain flow metadata.
+		// Enabling iptables for bridges is also required for Flannel CNI to ensure
+		// the iptables-based implementation of Kubernetes services functions correctly.
 		bridgeCallIptables = true
 		bridgeCallIp6tables = true
 		return linux.Sysctl{
@@ -507,11 +508,12 @@ func (r *LinuxNIReconciler) getIntendedBlackholeCfg() dg.Graph {
 		},
 		OutputIf: dummyIfRef,
 	}, nil)
+	mask := uint32(iptables.AceDropAction)
 	intendedBlackholeCfg.PutItem(linux.IPRule{
 		Priority: blackholePrio,
 		Table:    blackholeRT,
 		Mark:     iptables.AceDropAction,
-		Mask:     iptables.AceDropAction,
+		Mask:     &mask,
 	}, nil)
 	// Install iptables rule to ensure that packets marked with the drop action
 	// are indeed dropped and never sent out via downlink or port interfaces.
@@ -600,6 +602,10 @@ func (r *LinuxNIReconciler) getIntendedNIL2Cfg(niID uuid.UUID) dg.Graph {
 		IPAddresses:  bridgeIPs,
 		MTU:          ni.bridge.MTU,
 		WithSTP:      withSTP,
+	}, nil)
+	intendedL2Cfg.PutItem(linux.BridgeFwdMask{
+		BridgeIfName: ni.brIfName,
+		ForwardLLDP:  ni.config.ForwardLLDP,
 	}, nil)
 	// For Switch NI also add the intended VLAN configuration.
 	// Here we put VLAN config only for the bridge itself and the port interface,
@@ -705,7 +711,7 @@ func (r *LinuxNIReconciler) getIntendedNIL3Cfg(niID uuid.UUID) dg.Graph {
 	}
 	// Copy routes relevant for this NI from the main routing table into per-NI RT.
 	srcTable := unix.RT_TABLE_MAIN
-	dstTable := devicenetwork.NIBaseRTIndex + ni.bridge.BrNum
+	dstTable := types.NIBaseRTIndex + ni.bridge.BrNum
 	type outIf struct {
 		IfName  string
 		ItemRef dg.ItemRef
@@ -874,20 +880,20 @@ func (r *LinuxNIReconciler) getIntendedNIL3Cfg(niID uuid.UUID) dg.Graph {
 	// the network instance.
 	if bridgeIPHost != nil {
 		intendedL3Cfg.PutItem(linux.IPRule{
-			Priority: devicenetwork.PbrNatOutGatewayPrio,
+			Priority: types.PbrNatOutGatewayPrio,
 			Table:    syscall.RT_TABLE_LOCAL,
 			Src:      r.getNISubnet(ni),
 			Dst:      bridgeIPHost,
 		}, nil)
 	}
 	intendedL3Cfg.PutItem(linux.IPRule{
-		Priority: devicenetwork.PbrNatOutPrio,
-		Table:    devicenetwork.NIBaseRTIndex + ni.bridge.BrNum,
+		Priority: types.PbrNatOutPrio,
+		Table:    types.NIBaseRTIndex + ni.bridge.BrNum,
 		Src:      r.getNISubnet(ni),
 	}, nil)
 	intendedL3Cfg.PutItem(linux.IPRule{
-		Priority: devicenetwork.PbrNatInPrio,
-		Table:    devicenetwork.NIBaseRTIndex + ni.bridge.BrNum,
+		Priority: types.PbrNatInPrio,
+		Table:    types.NIBaseRTIndex + ni.bridge.BrNum,
 		Dst:      r.getNISubnet(ni),
 	}, nil)
 	// Add S-NAT iptables rules for the local network instance (only for IPv4).

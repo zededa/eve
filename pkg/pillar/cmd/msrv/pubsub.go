@@ -341,11 +341,6 @@ func (srv *Msrv) handlePatchEnvelopeModify(ctxArg interface{}, key string,
 	statusArg interface{}, oldStatusArg interface{}) {
 	peInfo := statusArg.(types.PatchEnvelopeInfoList)
 
-	if len(peInfo.Envelopes) == 0 {
-		srv.Log.Functionf("handlePatchEnvelopeModify: (UUID: %s). Empty envelopes", key)
-		return
-	}
-
 	srv.Log.Functionf("handlePatchEnvelopeModify: (UUID: %s) %v", key, peInfo.Envelopes)
 
 	srv.handlePatchEnvelopeImpl(peInfo)
@@ -484,6 +479,10 @@ func (srv *Msrv) handleGlobalConfigImpl(ctxArg interface{}, key string,
 			}
 			srv.metricInterval = metricInterval
 		}
+		// Set up rate limiting for prometheus metrics
+		srv.pmc.RPS = int(gcp.GlobalValueInt(types.MsrvPrometheusMetricsRequestPerSecond))
+		srv.pmc.Burst = int(gcp.GlobalValueInt(types.MsrvPrometheusMetricsBurst))
+		srv.pmc.IdleTimeout = time.Duration(gcp.GlobalValueInt(types.MsrvPrometheusMetricsIdleTimeoutSeconds)) * time.Second
 	}
 	srv.Log.Functionf("handleGlobalConfigImpl done for %s", key)
 }

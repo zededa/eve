@@ -1,3 +1,5 @@
+# Copyright (c) 2025, Zededa, Inc.
+# SPDX-License-Identifier: Apache-2.0
 ---
 name: Publish
 on:  # yamllint disable-line rule:truthy
@@ -15,19 +17,122 @@ on:  # yamllint disable-line rule:truthy
       - "[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"
 
 jobs:
-  packages:
+  # 1) non-ARM packages, fully parallel
+  packages-non-arm:
     if: github.event.repository.full_name == 'lf-edge/eve'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: arm64-secure
-            arch: arm64
-          - os: ubuntu-22.04
+          - os: zededa-ubuntu-2204
             arch: amd64
-          - os: ubuntu-latest
+            platform: "generic"
+            hv: kvm
+          - os: zededa-ubuntu-2204
+            arch: amd64
+            platform: "generic"
+            hv: kubevirt
+          - os: zededa-ubuntu-2204
             arch: riscv64
+            platform: "generic"
+            hv: mini
+    steps:
+      - name: Starting Report
+        run: |
+          echo Git Ref: ${{ github.ref }}
+          echo GitHub Event: ${{ github.event_name }}
+          echo Disk usage
+          df -h
+          echo Memory
+          free -m
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Force fetch annotated tags (workaround)
+        run: |
+          git fetch --force --tags
+      - name: Determine architecture prefix and ref
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "ARCH=${{ matrix.arch }}" >> "$GITHUB_ENV"
+          echo "TAG=$(echo "$REF" | sed -e 's#^.*/##' -e 's#master#snapshot#' -e 's#main#snapshot#')" >> "$GITHUB_ENV"
+      - name: Login to Docker Hub (build)
+        uses: docker/login-action@v3
+        if: ${{ github.event.repository.full_name }}== 'lf-edge/eve'
+        with:
+          username: ${{ secrets.DOCKERHUB_PULL_USER }}
+          password: ${{ secrets.DOCKERHUB_PULL_TOKEN }}
+      - name: Build packages
+        run: |
+          SUCCESS=
+          for i in 1 2 3; do
+            if make -e V=1 HV=${{ matrix.hv }} ZARCH=${{ matrix.arch }} PLATFORM=${{ matrix.platform }} LINUXKIT_PKG_TARGET=build pkgs; then
+              SUCCESS=true
+              break
+            else
+              docker rmi -f $(docker image ls -q) || :
+              docker system prune -f -a || :
+              docker rm -f $(docker ps -aq) && docker volume rm -f $(docker volume ls -q) || :
+            fi
+          done
+          if [ -z "$SUCCESS" ]; then echo "::error::failed to build packages" && exit 1; fi
+      - name: Login to Docker Hub (push)
+        uses: docker/login-action@v3
+        if: ${{ github.event.repository.full_name }}== 'lf-edge/eve'
+        with:
+          username: ${{ secrets.RELEASE_DOCKERHUB_ACCOUNT }}
+          password: ${{ secrets.RELEASE_DOCKERHUB_TOKEN }}
+      - name: Push packages
+        run: |
+          SUCCESS=
+          for i in 1 2 3; do
+            if make -e V=1 HV=${{ matrix.hv }} ZARCH=${{ matrix.arch }} PLATFORM=${{ matrix.platform }} LINUXKIT_PKG_TARGET=push PRUNE=1 pkgs; then
+              SUCCESS=true
+              break
+            else
+              docker rmi -f $(docker image ls -q) || :
+              docker system prune -f -a || :
+              docker rm -f $(docker ps -aq) && docker volume rm -f $(docker volume ls -q) || :
+            fi
+          done
+          if [ -z "$SUCCESS" ]; then echo "::error::failed to push packages" && exit 1; fi
+      - name: Post package report
+        run: |
+          echo Disk usage
+          df -h
+          echo Memory
+          free -m
+          docker system df
+          docker system df -v
+      - name: Clean
+        if: ${{ always() }}
+        run: |
+          make clean || :
+          docker system prune -f -a || :
+          docker rm -f $(docker ps -aq) && docker volume rm -f $(docker volume ls -q) || :
+          rm -rf ~/.linuxkit || :
+
+  # 2) ARM packages, serialized
+  packages-arm:
+    if: github.event.repository.full_name == 'lf-edge/eve'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 1440  # It takes more time when building arm64 on an amd64 runner
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - os: zededa-ubuntu-2204
+            arch: arm64
+            platform: "generic"
+          - os: zededa-ubuntu-2204
+            arch: arm64
+            platform: "nvidia-jp5"
+          - os: zededa-ubuntu-2204
+            arch: arm64
+            platform: "nvidia-jp6"
     steps:
       - name: Starting Report
         run: |
@@ -60,12 +165,12 @@ jobs:
           echo "ARCH=${{ matrix.arch }}" >> "$GITHUB_ENV"
           echo "TAG=$(echo "$REF" | sed -e 's#^.*/##' -e 's#master#snapshot#' -e 's#main#snapshot#')" >> "$GITHUB_ENV"
 
-      - name: Login to Docker Hub
+      - name: Login to Docker Hub (build)
         if: ${{ github.event.repository.full_name }}== 'lf-edge/eve'
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.RELEASE_DOCKERHUB_ACCOUNT }}
-          password: ${{ secrets.RELEASE_DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_PULL_USER }}
+          password: ${{ secrets.DOCKERHUB_PULL_TOKEN }}
 
       - name: Build packages
         run: |
@@ -73,7 +178,7 @@ jobs:
           # sadly, our build sometimes times out on network access
           # and running out of disk space: re-trying for 3 times
           for i in 1 2 3; do
-             if make -e V=1 LINUXKIT_PKG_TARGET=push PRUNE=1 pkgs; then
+             if make -e V=1 ZARCH=${{ matrix.arch }} PLATFORM=${{ matrix.platform }} LINUXKIT_PKG_TARGET=build pkgs; then
                 SUCCESS=true
                 break
              else
@@ -82,10 +187,37 @@ jobs:
                 # disk space. So the following can't hurt before we
                 # retry:
                 docker rmi -f `docker image ls -q` || :
-                docker system prune -f || :
+                docker system prune -f -a || :
+                docker rm -f $(docker ps -aq) && docker volume rm -f $(docker volume ls -q) || :
              fi
           done
-          if [ -z "$SUCCESS" ]; then echo "::error::failed to build and push packages" && exit 1; fi
+          if [ -z "$SUCCESS" ]; then echo "::error::failed to build packages" && exit 1; fi
+      - name: Login to Docker Hub (push)
+        if: ${{ github.event.repository.full_name }}== 'lf-edge/eve'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.RELEASE_DOCKERHUB_ACCOUNT }}
+          password: ${{ secrets.RELEASE_DOCKERHUB_TOKEN }}
+      - name: Push packages
+        run: |
+          SUCCESS=
+          # sadly, our build sometimes times out on network access
+          # and running out of disk space: re-trying for 3 times
+          for i in 1 2 3; do
+             if make -e V=1 ZARCH=${{ matrix.arch }} PLATFORM=${{ matrix.platform }} LINUXKIT_PKG_TARGET=push pkgs; then
+                SUCCESS=true
+                break
+             else
+                # the most likely reason for 'make pkgs' to fail is
+                # the docker cache produced by the build exhausting
+                # disk space. So the following can't hurt before we
+                # retry:
+                docker rmi -f `docker image ls -q` || :
+                docker system prune -f -a || :
+                docker rm -f $(docker ps -aq) && docker volume rm -f $(docker volume ls -q) || :
+             fi
+          done
+          if [ -z "$SUCCESS" ]; then echo "::error::failed to push packages" && exit 1; fi
       - name: Post package report
         run: |
           echo Disk usage
@@ -95,45 +227,74 @@ jobs:
           docker system df
           docker system df -v
       - name: Clean
+        if: ${{ always() }}
         run: |
-          make clean
-          docker system prune -f -a
-          rm -rf ~/.linuxkit
+          make clean || :
+          docker system prune -f -a || :
+          docker rm -f $(docker ps -aq) && docker volume rm -f $(docker volume ls -q) || :
+          rm -rf ~/.linuxkit || :
 
-  # eve composition can run as a separate job, even on a separate runner, because the packages job
-  # published everything. Which means all images are already on the OCI registry.
+  # 3) downstream jobs depend on both package jobs
   eve:
     if: github.event.repository.full_name == 'lf-edge/eve'
-    needs: packages
-    runs-on: ubuntu-latest
+    needs: [packages-non-arm, packages-arm]
+    runs-on: zededa-ubuntu-2204
     strategy:
       fail-fast: false
       matrix:
         arch: [arm64, amd64]
         hv: [kvm, xen]
+        platform: ["generic"]
         include:
           - arch: riscv64
             hv: mini
+            platform: "generic"
+          - arch: arm64
+            hv: kvm
+            platform: "nvidia-jp5"
+          - arch: arm64
+            hv: kvm
+            platform: "nvidia-jp6"
+          - arch: amd64
+            hv: kubevirt
+            platform: "generic"
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: ./.github/actions/run-make
+      - name: Build EVE
+        uses: ./.github/actions/run-make
         with:
-          command: "V=1 HV=${{ matrix.hv }} ZARCH=${{ matrix.arch }} LINUXKIT_PKG_TARGET=push eve"
+          command: "V=1 HV=${{ matrix.hv }} ZARCH=${{ matrix.arch }} PLATFORM=${{ matrix.platform }} LINUXKIT_PKG_TARGET=build eve"
+          dockerhub-token: ${{ secrets.DOCKERHUB_PULL_TOKEN }}
+          dockerhub-account: ${{ secrets.DOCKERHUB_PULL_USER }}
+          clean: false
+      - name: Push EVE
+        uses: ./.github/actions/run-make
+        with:
+          command: "V=1 HV=${{ matrix.hv }} ZARCH=${{ matrix.arch }} PLATFORM=${{ matrix.platform }} LINUXKIT_PKG_TARGET=push eve"
           dockerhub-token: ${{ secrets.RELEASE_DOCKERHUB_TOKEN }}
           dockerhub-account: ${{ secrets.RELEASE_DOCKERHUB_ACCOUNT }}
-      - uses: ./.github/actions/run-make
+      - name: Collect and push SBOM and sources
+        uses: ./.github/actions/run-make
         if: matrix.arch != 'riscv64'
         with:
-          command: "V=1 HV=${{ matrix.hv }} ZARCH=${{ matrix.arch }} LINUXKIT_PKG_TARGET=push sbom collected_sources compare_sbom_collected_sources publish_sources"
+          command: "V=1 HV=${{ matrix.hv }} ZARCH=${{ matrix.arch }} PLATFORM=${{ matrix.platform }} LINUXKIT_PKG_TARGET=push sbom collected_sources compare_sbom_collected_sources publish_sources"
           dockerhub-token: ${{ secrets.RELEASE_DOCKERHUB_TOKEN }}
           dockerhub-account: ${{ secrets.RELEASE_DOCKERHUB_ACCOUNT }}
+      - name: Clean
+        if: ${{ always() }}
+        run: |
+          make clean || :
+          docker system prune -f -a || :
+          docker rm -f $(docker ps -aq) && docker volume rm -f $(docker volume ls -q) || :
+          rm -rf ~/.linuxkit || :
 
   manifest:
     if: github.event.repository.full_name == 'lf-edge/eve'
-    runs-on: ubuntu-latest
-    needs: packages
+    needs: [packages-non-arm, packages-arm]
+    runs-on: zededa-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
         with:
@@ -148,5 +309,8 @@ jobs:
     if: ${{ (startsWith(github.ref, 'refs/tags/')) && (github.event.repository.full_name == 'lf-edge/eve') }}
     needs: [manifest, eve]
     uses: lf-edge/eve/.github/workflows/assets.yml@master
+    secrets:
+      DOCKERHUB_PULL_TOKEN: ${{ secrets.DOCKERHUB_PULL_TOKEN }}
+      DOCKERHUB_PULL_USER: ${{ secrets.DOCKERHUB_PULL_USER }}
     with:
       tag_ref: ${{ github.ref_name }}

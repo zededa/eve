@@ -24,6 +24,7 @@ import (
 	"github.com/google/go-tpm/legacy/tpm2"
 	"github.com/google/go-tpm/tpmutil"
 	"github.com/lf-edge/eve/api/go/attest"
+	etpm "github.com/lf-edge/eve/pkg/pillar/evetpm"
 	"github.com/schollz/progressbar/v3"
 	"google.golang.org/protobuf/proto"
 )
@@ -759,7 +760,11 @@ func deriveSessionKey(X, Y *big.Int, publicKey *ecdsa.PublicKey) ([32]byte, erro
 	}
 	defer rw.Close()
 
-	p := tpm2.ECPoint{XRaw: X.Bytes(), YRaw: Y.Bytes()}
+	p := tpm2.ECPoint{
+		XRaw: etpm.EccIntToBytes(publicKey.Curve, X),
+		YRaw: etpm.EccIntToBytes(publicKey.Curve, Y),
+	}
+
 	z, err := tpm2.ECDHZGen(rw, tpmutil.Handle(*ecdhIndex), "", p)
 	if err != nil {
 		return [32]byte{}, fmt.Errorf("deriveSessionKey failed: %v", err)

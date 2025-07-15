@@ -6,6 +6,7 @@ package types
 import (
 	"fmt"
 	"net"
+	"path"
 	"strings"
 	"time"
 
@@ -28,6 +29,7 @@ type AppNetworkConfig struct {
 	CloudInitUserData *string `json:"pubsub-large-CloudInitUserData"`
 	CipherBlockStatus CipherBlockStatus
 	MetaDataType      MetaDataType
+	DeploymentType    AppRuntimeType
 }
 
 // Key :
@@ -112,6 +114,7 @@ type AppNetworkStatus struct {
 	AppPod cnirpc.AppPod
 	// Copy from the AppNetworkConfig; used to delete when config is gone.
 	GetStatsIPAddr       net.IP
+	DeploymentType       AppRuntimeType
 	AppNetAdapterList    []AppNetAdapterStatus
 	AwaitNetworkInstance bool // If any Missing flag is set in the networks
 	// ID of the MAC generator variant that was used to generate MAC addresses for this app.
@@ -288,7 +291,7 @@ type AppNetAdapterConfig struct {
 	// Error
 	//	If there is a parsing error and this AppNetAdapterNetwork config cannot be
 	//	processed, set the error here. This allows the error to be propagated
-	//  back to zedcloud
+	//  back to the controller
 	Error           string
 	Network         uuid.UUID // Points to a NetworkInstance.
 	ACLs            []ACE
@@ -401,6 +404,16 @@ func (aa AssignedAddrs) GetInternallyLeasedIPv4Addr() net.IP {
 		}
 	}
 	return nil
+}
+
+// DnsmasqLeaseDir is a directory with files (one per NI bridge) storing IP leases
+// granted to applications by dnsmasq.
+const DnsmasqLeaseDir = "/run/zedrouter/dnsmasq.leases/"
+
+// DnsmasqLeaseFilePath returns the path to a file with IP leases granted
+// to applications connected to a given bridge.
+func DnsmasqLeaseFilePath(bridgeIfName string) string {
+	return path.Join(DnsmasqLeaseDir, bridgeIfName)
 }
 
 // AddressSource determines the source of an IP address assigned to an app VIF.
@@ -739,6 +752,15 @@ type NetworkInstanceConfig struct {
 	// VLAN configuration for application interfaces is applied separately via AppNetAdapterConfig
 	// (see AppNetAdapterConfig.AccessVlanID).
 	VlanAccessPorts []VlanAccessPort
+
+	// Enables forwarding of LLDP (Link Layer Discovery Protocol) frames across this
+	// network instance.
+	// LLDP is used by devices to advertise identity and capabilities to directly
+	// connected neighbors, and is often required for topology discovery and network
+	// management tools.
+	// When enabled, LLDP frames (EtherType 0x88cc) are not dropped or suppressed
+	// by the forwarding plane.
+	ForwardLLDP bool
 
 	// Any errors from the parser
 	// ErrorAndTime provides SetErrorNow() and ClearError()
@@ -1372,3 +1394,22 @@ const (
 	// provides).
 	MACGeneratorClusterDeterministic = 3
 )
+
+// NestedAppDomainStatus - status of a nested app domain
+// This is the struct of the nested app reported by runtime agent, and it is
+// published by zedrouter. One use case is for 'newlogd' to get the App structure
+// set up the same mechainsm as if it learned from the domainmgr's DomainStatus.
+// Because this nested app domain is configured through the Patch-envelop directly
+// to the runtime agent, and bypasses the EVE pillar, although some of the EVE
+// services may still want to know about those nested apps.
+type NestedAppDomainStatus struct {
+	UUIDandVersion UUIDandVersion // UUID of the nested app, e.g. a Docker-Compose App UUID
+	DisplayName    string         // nested App name
+	DisableLogs    bool           // if app log is disabled
+	ParentAppUUID  uuid.UUID      // parent app, a runtime VM UUID
+}
+
+// Key - returns the UUID for the nested app domain status
+func (status NestedAppDomainStatus) Key() string {
+	return status.UUIDandVersion.UUID.String()
+}

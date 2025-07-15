@@ -4,10 +4,10 @@
 ARG BUILD_PKGS_BASE="bash binutils-dev build-base bc bison flex openssl-dev util-linux-dev swig gnutls-dev perl python3 python3-dev py3-setuptools py3-pycryptodome py3-elftools"
 
 # we use the same image in several places
-ARG EVE_ALPINE_IMAGE=lfedge/eve-alpine:591df01e581889c3027514c8a91feaca1c8ad49f
+ARG EVE_ALPINE_IMAGE=lfedge/eve-alpine:0f2e0da38e30753c68410727a6cc269e57ff74f2
 
 # OPTEE-OS images
-FROM lfedge/eve-optee-os:150dfb58cd0fc2b781aa8e700d479e369c8cc5e9 AS optee-os
+FROM lfedge/eve-optee-os:15ce27bdb72f404407464b630483bae06d9ecd53 AS optee-os
 
 # hadolint ignore=DL3006
 FROM ${EVE_ALPINE_IMAGE} as build-native
@@ -20,12 +20,12 @@ ARG BUILD_PKGS_BASE
 RUN BUILD_PKGS="${BUILD_PKGS_BASE}" eve-alpine-deploy.sh
 
 # hadolint ignore=DL3029
-FROM --platform=${BUILDPLATFORM} lfedge/eve-cross-compilers:250abc77c8c39664905b66a2673102ec5cd3b056 AS cross-compilers
+FROM --platform=${BUILDPLATFORM} lfedge/eve-cross-compilers:fb809cfb1909752acb563e0b77cd3799534bce64 AS cross-compilers
 
 # will use several packages from target arch and copy them to sysroot
 # hadolint ignore=DL3006
 FROM ${EVE_ALPINE_IMAGE} AS cross-compile-libs
-ENV PKGS musl-dev libgcc libintl libuuid libtirpc libblkid
+ENV PKGS="musl-dev libgcc libintl libuuid libtirpc libblkid"
 RUN eve-alpine-deploy.sh
 
 # adjust EVE_TARGET_ARCH for cross-compiler
@@ -38,7 +38,7 @@ ENV EVE_TARGET_ARCH=riscv64
 
 # hadolint ignore=DL3006
 FROM build-cross-target-${TARGETARCH} AS build-cross-target
-ENV CROSS_COMPILE_ENV="${EVE_TARGET_ARCH}"-alpine-linux-musl-
+ENV CROSS_COMPILE_ENV="${EVE_TARGET_ARCH}-alpine-linux-musl-"
 COPY --from=cross-compilers /packages /packages
 # hadolint ignore=DL3018
 RUN apk add --no-cache --allow-untrusted -X /packages build-base-"${EVE_TARGET_ARCH}"

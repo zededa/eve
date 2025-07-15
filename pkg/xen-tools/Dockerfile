@@ -3,8 +3,8 @@
 # Copyright (c) 2023 Zededa, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-FROM lfedge/eve-uefi:1f971167cc8866c306ffc7f4157665a1a2e6d95d as uefi-build
-FROM lfedge/eve-alpine:591df01e581889c3027514c8a91feaca1c8ad49f AS runx-build
+FROM lfedge/eve-uefi:575f1b1b2f033dc5f61c03a66e8b60a896c5bb56 as uefi-build
+FROM lfedge/eve-alpine:0f2e0da38e30753c68410727a6cc269e57ff74f2 AS runx-build
 ENV BUILD_PKGS mkinitfs gcc musl-dev e2fsprogs chrony agetty
 RUN eve-alpine-deploy.sh
 
@@ -15,11 +15,12 @@ COPY initrd/poweroff /sbin/poweroff
 COPY initrd/chroot2.c initrd/hacf.c /tmp/
 COPY initrd/00000080 /etc/acpi/PWRF/
 COPY initrd/eve-enter-container /bin/
+COPY initrd/dotprofile /root/.profile
 RUN gcc -s -o /chroot2 /tmp/chroot2.c -Wall -Werror
 RUN gcc -s -o /hacf /tmp/hacf.c -Wall -Werror
 RUN mkinitfs -n -F base -i /init-initrd -o /runx-initrd
 
-FROM lfedge/eve-alpine:591df01e581889c3027514c8a91feaca1c8ad49f AS build
+FROM lfedge/eve-alpine:0f2e0da38e30753c68410727a6cc269e57ff74f2 AS build
 ENV BUILD_PKGS \
     gcc make libc-dev dev86 xz-dev perl bash python3-dev \
     gettext iasl util-linux-dev ncurses-dev glib-dev \
@@ -95,8 +96,11 @@ WORKDIR /xen
 
 # disable golang as it does not play well together with musl (stderr is defined as FILE* const and fails to compile)
 RUN ./configure --prefix=/usr --disable-xen --disable-golang --disable-qemu-traditional --disable-docs --enable-9pfs \
- --with-system-ovmf=/usr/lib/xen/boot/ovmf.bin --disable-stubdom \
- --enable-vhost-vsock --enable-vhost-scsi
+ --with-system-ovmf=/usr/lib/xen/boot/ovmf.bin --disable-stubdom --disable-openbios \
+ --enable-vhost-vsock --enable-vhost-scsi \
+ --disable-microblaze --disable-mips --disable-ppc \
+ --disable-sparc --disable-tricore --disable-alpha --disable-hppa \
+ --disable-storage-daemon
 RUN make -j "$(getconf _NPROCESSORS_ONLN)" && make dist
 RUN dist/install.sh /out
 
@@ -121,6 +125,10 @@ COPY qemu-ifup xen-start /etc/xen/scripts/
 
 # We need to keep a slim profile, which means removing things we don't need
 RUN rm -rf /usr/lib/libxen*.a /usr/lib/libxl*.a /usr/lib/debug /usr/lib/python*
+
+RUN rm -rf /usr/share/man \
+    /usr/share/qemu-xen/qemu/openbios-* \
+    /usr/lib/xen/bin/qemu-storage-daemon
 
 # Adjust /var/run, /var/lib and /var/lock to be shared
 RUN mv /var /var.template && ln -s /run /var && ln -s /run /var.template/run

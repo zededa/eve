@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -205,6 +206,26 @@ func TestRequestPatchEnvelopes(t *testing.T) {
 						URL:      "a.txt",
 					},
 				},
+				CipherBlobs: []types.BinaryCipherBlob{
+					{
+						EncType: types.BlobEncrytedTypeInline,
+						Inline: &types.BinaryBlobCompleted{
+							FileName: "abcd2",
+							FileSha:  "abcd2",
+							URL:      "a2.txt",
+						},
+					},
+					{
+						EncType: types.BlobEncrytedTypeVolume,
+						Volume: &types.BinaryBlobVolumeRef{
+							FileName:         "abcd3a",
+							ImageName:        "abcd3b",
+							FileMetadata:     "abcd3c",
+							ArtifactMetadata: "abcd3d",
+							ImageID:          "abcd3e",
+						},
+					},
+				},
 			},
 		},
 	})
@@ -259,6 +280,23 @@ func TestRequestPatchEnvelopes(t *testing.T) {
 							ArtifactMetadata: "",
 							URL:              "http://169.254.169.254/eve/v1/patch/download/6ba7b810-9dad-11d1-80b4-111111111111/abcd",
 							Size:             0,
+						},
+						{
+							FileName:         "abcd2",
+							FileSha:          "abcd2",
+							FileMetadata:     "",
+							ArtifactMetadata: "",
+							URL:              "http://169.254.169.254/eve/v1/patch/download/6ba7b810-9dad-11d1-80b4-111111111111/abcd2",
+							Size:             0,
+						},
+					},
+					VolumeRefs: []types.BinaryBlobVolumeRef{
+						{
+							FileName:         "abcd3a",
+							ImageName:        "abcd3b",
+							FileMetadata:     "abcd3c",
+							ArtifactMetadata: "abcd3d",
+							ImageID:          "abcd3e",
 						},
 					},
 				},
@@ -442,4 +480,77 @@ func TestHandleAppInstanceDiscovery(t *testing.T) {
 	descResp = httptest.NewRecorder()
 	handler.ServeHTTP(descResp, descReq)
 	g.Expect(descResp.Code).To(gomega.Equal(http.StatusForbidden))
+}
+
+func TestReverseProxy(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewGomegaWithT(t)
+
+	logger := logrus.StandardLogger()
+	log := base.NewSourceLogObject(logger, "pubsub", 1234)
+	ps := pubsub.New(pubsub.NewMemoryDriver(), logger, log)
+
+	srv := &msrv.Msrv{
+		Log:    log,
+		PubSub: ps,
+		Logger: logger,
+	}
+
+	dir, err := os.MkdirTemp("/tmp", "msrv_test")
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+	defer os.RemoveAll(dir)
+
+	err = srv.Init(dir, true)
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	err = srv.Activate()
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	handler := srv.MakeMetadataHandler()
+
+	var count int32
+	backend := &http.Server{
+		Addr: "localhost:9100",
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&count, 1)
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("proxied response"))
+		}),
+	}
+
+	ln, err := net.Listen("tcp", "localhost:9100")
+	g.Expect(err).ToNot(gomega.HaveOccurred())
+
+	go func() {
+		_ = backend.Serve(ln)
+	}()
+	defer func() {
+		_ = backend.Close()
+	}()
+
+	makeReq := func(ip string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		req.RemoteAddr = ip + ":12345"
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		return rr
+	}
+
+	ip1 := "10.0.0.1"
+	ip2 := "10.0.0.2"
+
+	// 1st request from each IP should succeed
+	rr := makeReq(ip1)
+	g.Expect(rr.Code).To(gomega.Equal(http.StatusOK))
+	// Burst of requests, which should be rate limited
+	for range 10 {
+		_ = makeReq(ip1)
+	}
+	// request after burst should fail
+	rr = makeReq(ip1)
+	g.Expect(rr.Code).To(gomega.Equal(http.StatusTooManyRequests))
+
+	rr = makeReq(ip2)
+	g.Expect(rr.Code).To(gomega.Equal(http.StatusOK))
+
 }

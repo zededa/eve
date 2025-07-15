@@ -47,7 +47,7 @@ const (
 	eveLabelKey            = "App-Domain-Name"
 	waitForPodCheckCounter = 5  // Check 5 times
 	waitForPodCheckTime    = 15 // Check every 15 seconds, don't wait for too long to cause watchdog
-	tolerateSec            = 30 // Pod/VMI reschedule delay after node unreachable seconds
+	tolerateSec            = 15 // Pod/VMI reschedule delay after node unreachable seconds
 	unknownToHaltMinutes   = 5  // If VMI is unknown for 5 minutes, return halt state
 )
 
@@ -427,7 +427,7 @@ func (ctx kubevirtContext) CreateReplicaVMIConfig(domainName string, config type
 			}
 			if ib.PciLong != "" {
 				logrus.Infof("Adding PCI device <%v>\n", ib.PciLong)
-				tap := pciDevice{pciLong: ib.PciLong, ioType: ib.Type}
+				tap := pciDevice{ioBundle: *ib}
 				pciAssignments = addNoDuplicatePCI(pciAssignments, tap)
 			}
 		}
@@ -542,12 +542,18 @@ func (ctx kubevirtContext) Start(domainName string) error {
 	for {
 		_, err = virtClient.ReplicaSet(kubeapi.EVEKubeNameSpace).Create(repvmi)
 		if err != nil {
+			if errors.IsAlreadyExists(err) {
+				// VMI could have been already started, for example failover from other node.
+				// Its not an error, just proceed.
+				logrus.Warnf("VMI replicaset %v already exists", repvmi)
+				break
+			}
 			if strings.Contains(err.Error(), "dial tcp 127.0.0.1:6443") && i <= 0 {
-				logrus.Infof("Start VMI replicaset failed %v\n", err)
+				logrus.Errorf("Start VMI replicaset failed %v\n", err)
 				return err
 			}
 			time.Sleep(10 * time.Second)
-			logrus.Infof("Start VMI replicaset failed, retry (%d) err %v", i, err)
+			logrus.Errorf("Start VMI replicaset failed, retry (%d) err %v", i, err)
 		} else {
 			break
 		}
@@ -1161,48 +1167,46 @@ func (ctx kubevirtContext) CreateReplicaPodConfig(domainName string, config type
 
 	// Add pod non-image volume disks
 	if len(diskStatusList) > 1 {
-		length := len(diskStatusList) - 1
+		logrus.Infof("CreateReplicaPodConfig: diskStatusList:%v", diskStatusList)
+
+		var volumes []k8sv1.Volume
+		var mounts []k8sv1.VolumeMount
+		var devs []k8sv1.VolumeDevice
+
 		for _, ds := range diskStatusList[1:] {
 			if ds.Devtype == "9P" { // skip 9P volume type
-				if length > 0 {
-					length--
-				} else {
-					break
-				}
+				continue
 			}
-		}
-		if length > 0 {
-			volumes := make([]k8sv1.Volume, length)
-			mounts := make([]k8sv1.VolumeMount, length)
 
-			i := 0
-			for _, ds := range diskStatusList[1:] {
-				if ds.Devtype == "9P" {
-					continue
-				}
-				voldispName := strings.ToLower(ds.DisplayName)
-				//voldevs[i] = k8sv1.VolumeDevice{
-				//	Name:       voldispName,
-				//	DevicePath: ds.MountDir,
-				//}
-				mounts[i] = k8sv1.VolumeMount{
+			voldispName := strings.ToLower("vol-" + ds.FileLocation)
+
+			if ds.MountDir == "" {
+				devs = append(devs, k8sv1.VolumeDevice{
+					Name:       voldispName,
+					DevicePath: "/dev/" + ds.Vdev,
+				})
+			} else {
+				mounts = append(mounts, k8sv1.VolumeMount{
 					Name:      voldispName,
 					MountPath: ds.MountDir,
-				}
-
-				volumes[i].Name = voldispName
-				volumes[i].VolumeSource = k8sv1.VolumeSource{
-					PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{
-						ClaimName: strings.ToLower(ds.DisplayName),
-						//ClaimName: ds.VolumeKey,
-					},
-				}
-				logrus.Infof("CreateReplicaPodConfig:(%d) mount[i] %+v, volumes[i] %+v", i, mounts[i], volumes[i])
-				i++
+					ReadOnly:  ds.ReadOnly,
+				})
 			}
-			replicaSet.Spec.Template.Spec.Containers[0].VolumeMounts = mounts
-			replicaSet.Spec.Template.Spec.Volumes = volumes
+
+			vol := k8sv1.Volume{
+				Name: voldispName,
+				VolumeSource: k8sv1.VolumeSource{
+					PersistentVolumeClaim: &k8sv1.PersistentVolumeClaimVolumeSource{
+						ClaimName: strings.ToLower(ds.FileLocation),
+					},
+				},
+			}
+			volumes = append(volumes, vol)
+			logrus.Infof("CreateReplicaPodConfig: mounts %+v, volumes %+v, devices %+v", mounts, volumes, devs)
 		}
+		replicaSet.Spec.Template.Spec.Containers[0].VolumeMounts = mounts
+		replicaSet.Spec.Template.Spec.Containers[0].VolumeDevices = devs
+		replicaSet.Spec.Template.Spec.Volumes = volumes
 	}
 	logrus.Infof("CreateReplicaPodConfig: replicaset setup %+v", replicaSet)
 
@@ -1720,6 +1724,10 @@ func (ctx kubevirtContext) VirtualTPMTerminate(domainName string, wp *types.Watc
 }
 
 func (ctx kubevirtContext) VirtualTPMTeardown(domainName string, wp *types.WatchdogParam) error {
+	return fmt.Errorf("not implemented")
+}
+
+func (ctx kubevirtContext) OemWindowsLicenseKeySetup(wlk *types.OemWindowsLicenseKeyInfo) error {
 	return fmt.Errorf("not implemented")
 }
 

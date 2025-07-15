@@ -8,9 +8,9 @@
 # has a fast path for stack unwinding. This also happens
 # to be a perfect place to put any other kind of debug info
 # into the package: see abuild/etc/abuild.conf.
-FROM lfedge/eve-recovertpm:0da17f65aba4fb09c83944cf5847dd7b523118b4 AS recovertpm
-FROM lfedge/eve-bpftrace:64f87b9dfce42524b0364159a6cc3b88ae3445b2 AS bpftrace
-FROM lfedge/eve-alpine:591df01e581889c3027514c8a91feaca1c8ad49f AS build
+FROM lfedge/eve-recovertpm:25f66701fa7ce348631e5d9bf4efc5082a497b8b AS recovertpm
+FROM lfedge/eve-bpftrace:faebad58df4cddaa07d15937021854d8165d7c9a AS bpftrace
+FROM lfedge/eve-alpine:0f2e0da38e30753c68410727a6cc269e57ff74f2 AS build
 ENV BUILD_PKGS="abuild curl tar make linux-headers patch g++ git gcc gpg ncurses-dev autoconf openssl-dev zlib-dev"
 # Feel free to add additional packages here, but be aware that
 # EVE's rootfs image can be no larger than 300Mb (and don't
@@ -93,7 +93,6 @@ RUN ./configure \
 
 RUN make -j "$(getconf _NPROCESSORS_ONLN)"
 RUN make install
-RUN HARNESS_JOBS="$(getconf _NPROCESSORS_ONLN)" make tests
 
 RUN /usr/bin/install -c -m 0755 -s ssh /out/usr/bin/ssh
 RUN /usr/bin/install -c -m 0755 -s scp /out/usr/bin/scp
@@ -131,5 +130,7 @@ WORKDIR /
 
 COPY --from=build /out/ /
 COPY --from=build /bpftrace/bpftrace-aotrt /
+
+RUN rm -rf /usr/share/vim/vim82/doc/
 
 CMD ["/sbin/tini", "/usr/bin/debug-services.sh"]

@@ -1,7 +1,7 @@
 // Copyright (c) 2017-2018 Zededa, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Push metrics to zedcloud
+// Push metrics to controller
 
 package zedagent
 
@@ -18,14 +18,16 @@ import (
 	"time"
 
 	"github.com/lf-edge/eve-api/go/evecommon"
+	"github.com/lf-edge/eve-api/go/hardwarehealth"
 	"github.com/lf-edge/eve-api/go/info"
 	"github.com/lf-edge/eve-api/go/metrics"
 	zmet "github.com/lf-edge/eve-api/go/metrics" // zinfo and zmet here
+	"github.com/lf-edge/eve/pkg/pillar/controllerconn"
 	"github.com/lf-edge/eve/pkg/pillar/flextimer"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/utils"
 	"github.com/lf-edge/eve/pkg/pillar/utils/persist"
-	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
+	"github.com/multiplay/go-edac/lib/edac"
 	"github.com/shirou/gopsutil/host"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -339,10 +341,6 @@ func publishMetrics(ctx *zedagentContext, iteration int) {
 	// Only report stats for the ports in DeviceNetworkStatus
 	for _, p := range deviceNetworkStatus.Ports {
 		var metric *types.NetworkMetric
-		if !p.IsL3Port {
-			// metrics for ports from lower layers are not reported
-			continue
-		}
 		if p.IfName == "" {
 			// Cannot associate metrics with the port until interface name is known.
 			continue
@@ -388,7 +386,7 @@ func publishMetrics(ctx *zedagentContext, iteration int) {
 
 	// Transfer to a local copy in since metrics updates are done concurrently
 	cms := types.MetricsMap{}
-	ctx.zedcloudMetrics.AddInto(log, cms)
+	ctx.agentMetrics.AddInto(log, cms)
 	clientMetrics.AddInto(cms)
 	downloaderMetrics.AddInto(cms)
 	loguploaderMetrics.AddInto(cms)
@@ -408,7 +406,7 @@ func publishMetrics(ctx *zedagentContext, iteration int) {
 			metric.LastSuccess = timestamppb.New(cm.LastSuccess)
 		}
 		for url, um := range cm.URLCounters {
-			log.Tracef("CloudMetrics[%s] url %s %v",
+			log.Tracef("ControllerConnMetrics[%s] url %s %v",
 				ifname, url, um)
 			urlMet := new(metrics.UrlcloudMetric)
 			urlMet.Url = url
@@ -857,8 +855,8 @@ func publishMetrics(ctx *zedagentContext, iteration int) {
 	log.Tracef("publishMetrics: after send, total elapse sec %v", time.Since(startPubTime).Seconds())
 
 	// publish the cloud MetricsMap for zedagent for device debugging purpose
-	if ctx.zedcloudMetrics != nil {
-		ctx.zedcloudMetrics.Publish(log, ctx.pubMetricsMap, "global")
+	if ctx.agentMetrics != nil {
+		ctx.agentMetrics.Publish(log, ctx.pubMetricsMap, "global")
 	}
 }
 
@@ -999,6 +997,125 @@ func setMetricAnyValue(item *metrics.MetricItem, val interface{}) {
 	default:
 		log.Errorf("setMetricAnyValue unknown %T", t)
 	}
+}
+
+// hardwareHealthTimerTask periodically publishes hardware health check reports.
+// It starts by attempting an initial health check report. If the initial attempt fails,
+// it uses a short retry interval; otherwise, it uses a configurable interval from globalConfig.
+//
+// The function runs indefinitely until the process is stopped or the context is canceled.
+func hardwareHealthTimerTask(ctx *zedagentContext, handleChannel chan interface{}) {
+	iteration := 0
+	log.Functionln("starting report health check timer task")
+	success := publishΗealthChecksReport(ctx, iteration)
+	retry := !success
+
+	// Run a timer for extra safety to send hardwarehealth updates
+	// If we failed with the initial we have a short timer, otherwise
+	// the configurable one.
+	const shortTimeSecs = 120 // Short time: two minutes
+	hardwareHealthInterval := ctx.globalConfig.GlobalValueInt(types.HardwareHealthInterval)
+	interval := time.Duration(hardwareHealthInterval)
+	if retry {
+		log.Noticef("Initial publishHardwareHealth failed; switching to short timer")
+		interval = shortTimeSecs
+	}
+	max := float64(interval * time.Second)
+	min := max * 0.3
+	ticker := flextimer.NewRangeTicker(time.Duration(min), time.Duration(max))
+	// Return handle to caller
+	handleChannel <- ticker
+
+	wdName := agentName + "hardwarehealth"
+
+	// Run a periodic timer so we always update StillRunning
+	stillRunning := time.NewTicker(25 * time.Second)
+	ctx.ps.StillRunning(wdName, warningTime, errorTime)
+	ctx.ps.RegisterFileWatchdog(wdName)
+
+	for {
+		select {
+		case <-ticker.C:
+			start := time.Now()
+			iteration++
+			success = publishΗealthChecksReport(ctx, iteration) // update success status
+			ctx.ps.CheckMaxTimeTopic(wdName, "publishHardwareHealth", start,
+				warningTime, errorTime)
+
+			if retry && success {
+				log.Noticef("Publishing hardwarehealth succeeded; switching to long timer %d seconds",
+					hardwareHealthInterval)
+				updateTaskTimer(hardwareHealthInterval, ticker)
+				retry = false
+			} else if !retry && !success {
+				log.Noticef("Hardwarehealth failed; switching to short timer")
+				updateTaskTimer(shortTimeSecs, ticker)
+				retry = true
+			}
+		case <-stillRunning.C:
+		}
+		ctx.ps.StillRunning(wdName, warningTime, errorTime)
+	}
+}
+
+// publishΗealthChecksReport collects hardware health metrics, currently only for ECC memory
+// and publishes a health report to the controller. If ECC memory controllers are not present
+// or an error occurs during collection, an empty report is sent to indicate the inability to
+// gather the information.
+//
+// Returns:
+//
+//	bool - The result of the sendHardwareHealthProtobuf operation.
+func publishΗealthChecksReport(ctx *zedagentContext, iteration int) bool {
+	log.Functionf("publishΗealthChecksReport")
+	var ReportHardwareHealth = &hardwarehealth.ZHardwareHealth{}
+
+	ReportHardwareHealth.DevId = *proto.String(devUUID.String())
+	ReportHardwareHealth.AtTimeStamp = timestamppb.Now()
+
+	ReportMemoryInfo := new(hardwarehealth.ECCMemoryReport)
+
+	mcs, err := edac.MemoryControllers()
+	if err != nil {
+		log.Error(err)
+	}
+
+	for _, c := range mcs {
+		i, err := c.Info()
+		if err != nil {
+			log.Error(err)
+			continue
+		}
+
+		// Add ECC memory controller info
+		memoryInfo := &hardwarehealth.ECCMemoryControllerInfo{
+			ControllerName: i.Name,
+			CeCount:        i.Correctable,
+			UeCount:        i.Uncorrectable,
+		}
+
+		// Retrieve and add DIMM ranks
+		ranks, err := c.DimmRanks()
+		if err != nil {
+			log.Error(err)
+			continue
+		}
+
+		for _, r := range ranks {
+			dimmRank := &hardwarehealth.DimmRankInfo{
+				RankName: r.Name,
+				CeCount:  r.Correctable,
+				UeCount:  r.Uncorrectable,
+			}
+			memoryInfo.Ranks = append(memoryInfo.Ranks, dimmRank)
+		}
+
+		ReportMemoryInfo.MemoryControllers = append(ReportMemoryInfo.MemoryControllers, memoryInfo)
+	}
+	ReportHardwareHealth.Mr = ReportMemoryInfo
+
+	log.Tracef("PublishHardwareHealthToZedCloud sending %s", ReportHardwareHealth)
+	return sendHardwareHealthProtobuf(ctx.getconfigCtx, ReportHardwareHealth, iteration)
 }
 
 func encodeProxyStatus(proxyConfig *types.ProxyConfig) *info.ProxyStatus {
@@ -1175,12 +1292,11 @@ func PublishAppInfoToZedCloud(ctx *zedagentContext, uuid string,
 	if buf == nil {
 		log.Fatal("malloc error")
 	}
-	size := int64(proto.Size(ReportInfo))
 
 	//We queue the message and then get the highest priority message to send.
 	//If there are no failures and defers we'll send this message,
 	//but if there is a queue we'll retry sending the highest priority message.
-	queueInfoToDest(ctx, dest, uuid, buf, size, true, false, false,
+	queueInfoToDest(ctx, dest, uuid, buf, true, false, false,
 		info.ZInfoTypes_ZiApp)
 }
 
@@ -1242,12 +1358,11 @@ func PublishContentInfoToZedCloud(ctx *zedagentContext, uuid string,
 	if buf == nil {
 		log.Fatal("malloc error")
 	}
-	size := int64(proto.Size(ReportInfo))
 
 	//We queue the message and then get the highest priority message to send.
 	//If there are no failures and defers we'll send this message,
 	//but if there is a queue we'll retry sending the highest priority message.
-	queueInfoToDest(ctx, dest, uuid, buf, size, true, false, false,
+	queueInfoToDest(ctx, dest, uuid, buf, true, false, false,
 		info.ZInfoTypes_ZiContentTree)
 }
 
@@ -1317,12 +1432,11 @@ func PublishVolumeToZedCloud(ctx *zedagentContext, uuid string,
 	if buf == nil {
 		log.Fatal("malloc error")
 	}
-	size := int64(proto.Size(ReportInfo))
 
 	//We queue the message and then get the highest priority message to send.
 	//If there are no failures and defers we'll send this message,
 	//but if there is a queue we'll retry sending the highest priority message.
-	queueInfoToDest(ctx, dest, uuid, buf, size, true, false, false,
+	queueInfoToDest(ctx, dest, uuid, buf, true, false, false,
 		info.ZInfoTypes_ZiVolume)
 }
 
@@ -1373,12 +1487,11 @@ func PublishBlobInfoToZedCloud(ctx *zedagentContext, blobSha string,
 	if buf == nil {
 		log.Fatal("malloc error")
 	}
-	size := int64(proto.Size(ReportInfo))
 
 	//We queue the message and then get the highest priority message to send.
 	//If there are no failures and defers we'll send this message,
 	//but if there is a queue we'll retry sending the highest priority message.
-	queueInfoToDest(ctx, dest, blobSha, buf, size, true, false, false,
+	queueInfoToDest(ctx, dest, blobSha, buf, true, false, false,
 		info.ZInfoTypes_ZiBlobList)
 }
 
@@ -1431,12 +1544,11 @@ func PublishEdgeviewToZedCloud(ctx *zedagentContext,
 	if buf == nil {
 		log.Fatal("malloc error")
 	}
-	size := int64(proto.Size(ReportInfo))
 
 	//We queue the message and then get the highest priority message to send.
 	//If there are no failures and defers we'll send this message,
 	//but if there is a queue we'll retry sending the highest priority message.
-	queueInfoToDest(ctx, dest, "global", buf, size, bailOnHTTPErr, false, forcePeriodic,
+	queueInfoToDest(ctx, dest, "global", buf, bailOnHTTPErr, false, forcePeriodic,
 		info.ZInfoTypes_ZiEdgeview)
 }
 
@@ -1468,20 +1580,20 @@ func appIfnameToName(aiStatus *types.AppInstanceStatus, vifname string) string {
 // For each port we try different source IPs until we find a working one.
 // For the HTTP errors indicating the object is gone we ignore the error
 // so the caller does not defer and retry
-func SendProtobuf(url string, buf *bytes.Buffer, size int64,
-	iteration int) error {
-
-	const bailOnHTTPErr = true // For 4xx and 5xx HTTP errors we don't try other interfaces
-	const withNetTrace = false
-	ctxWork, cancel := zedcloud.GetContextForAllIntfFunctions(zedcloudCtx)
+func SendProtobuf(url string, buf *bytes.Buffer, iteration int) error {
+	ctxWork, cancel := ctrlClient.GetContextForAllIntfFunctions()
 	defer cancel()
-	rv, err := zedcloud.SendOnAllIntf(ctxWork, zedcloudCtx, url,
-		size, buf, iteration, bailOnHTTPErr, withNetTrace)
+	rv, err := ctrlClient.SendOnAllIntf(ctxWork, url, buf, controllerconn.RequestOptions{
+		WithNetTracing: false,
+		// For 4xx and 5xx HTTP errors we don't try other interfaces
+		BailOnHTTPErr: true,
+		Iteration:     iteration,
+	})
 	if rv.HTTPResp != nil {
 		switch rv.HTTPResp.StatusCode {
 		// XXX Some controller gives a generic 400 which should be fixed
 		case http.StatusBadRequest:
-			log.Warnf("XXX SendProtoBuf: %s silently ignore code %d %s",
+			log.Warnf("SendProtoBuf: Ignoring bad request for %s - code %d %s (controller issue should be fixed)",
 				url, rv.HTTPResp.StatusCode, http.StatusText(rv.HTTPResp.StatusCode))
 			return nil
 
@@ -1500,7 +1612,7 @@ func SendProtobuf(url string, buf *bytes.Buffer, size int64,
 // Each iteration we try a different port for load spreading.
 // For each port we try all its local IP addresses until we get a success.
 func sendMetricsProtobufByURL(ctx *getconfigContext, metricsURL string,
-	ReportMetrics *metrics.ZMetricMsg, iteration int) {
+	ReportMetrics *metrics.ZMetricMsg, iteration int, expectNoConn bool) {
 
 	data, err := proto.Marshal(ReportMetrics)
 	if err != nil {
@@ -1508,16 +1620,20 @@ func sendMetricsProtobufByURL(ctx *getconfigContext, metricsURL string,
 	}
 
 	buf := bytes.NewBuffer(data)
-	size := int64(proto.Size(ReportMetrics))
-	const bailOnHTTPErr = false
-	const withNetTrace = false
-	ctxWork, cancel := zedcloud.GetContextForAllIntfFunctions(zedcloudCtx)
+	ctxWork, cancel := ctrlClient.GetContextForAllIntfFunctions()
 	defer cancel()
-	rv, err := zedcloud.SendOnAllIntf(ctxWork, zedcloudCtx, metricsURL,
-		size, buf, iteration, bailOnHTTPErr, withNetTrace)
+	rv, err := ctrlClient.SendOnAllIntf(ctxWork, metricsURL, buf,
+		controllerconn.RequestOptions{
+			WithNetTracing: false,
+			BailOnHTTPErr:  false,
+			Iteration:      iteration,
+			SuppressLogs:   expectNoConn,
+		})
 	if err != nil {
 		// Hopefully next timeout will be more successful
-		log.Errorf("sendMetricsProtobufByURL status %d failed: %s", rv.Status, err)
+		if !expectNoConn {
+			log.Errorf("sendMetricsProtobufByURL status %d failed: %s", rv.Status, err)
+		}
 		return
 	} else {
 		maybeUpdateMetricsTimer(ctx, true)
@@ -1528,9 +1644,9 @@ func sendMetricsProtobufByURL(ctx *getconfigContext, metricsURL string,
 func sendMetricsProtobuf(ctx *getconfigContext,
 	ReportMetrics *metrics.ZMetricMsg, iteration int) {
 
-	url := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API,
+	url := controllerconn.URLPathString(serverNameAndPort, ctrlClient.UsingV2API(),
 		devUUID, "metrics")
-	sendMetricsProtobufByURL(ctx, url, ReportMetrics, iteration)
+	sendMetricsProtobufByURL(ctx, url, ReportMetrics, iteration, ctx.zedagentCtx.airgapMode)
 
 	locConfig := ctx.sideController.locConfig
 
@@ -1538,11 +1654,80 @@ func sendMetricsProtobuf(ctx *getconfigContext,
 	if locConfig != nil {
 		// Don't block current execution context
 		go func() {
-			url := zedcloud.URLPathString(locConfig.LocURL, zedcloudCtx.V2API,
+			url := controllerconn.URLPathString(locConfig.LocURL, ctrlClient.UsingV2API(),
 				devUUID, "metrics")
-			sendMetricsProtobufByURL(ctx, url, ReportMetrics, iteration)
+			sendMetricsProtobufByURL(ctx, url, ReportMetrics, iteration, false)
 		}()
 	}
+}
+
+// sendHardwareHealthProtobufByURL serializes the provided ZHardwareHealth protobuf message and sends it
+// to the specified hardware health URL using the zedcloud transport layer. The function attempts to send
+// the message on all available network interfaces, handling marshaling errors and HTTP transmission errors.
+// On successful transmission, the sent message is saved for record-keeping.
+//
+// Returns:
+//   - bool: true if the message was sent successfully, false otherwise.
+func sendHardwareHealthProtobufByURL(ctx *getconfigContext, hardwareHealthURL string,
+	HardwareHealth *hardwarehealth.ZHardwareHealth, iteration int, expectNoConn bool) bool {
+
+	data, err := proto.Marshal(HardwareHealth)
+	if err != nil {
+		log.Fatal("sendHardwareHealthProtobufByURL proto marshaling error: ", err)
+	}
+
+	buf := bytes.NewBuffer(data)
+	ctxWork, cancel := ctrlClient.GetContextForAllIntfFunctions()
+	defer cancel()
+	if !expectNoConn {
+		log.Noticef("sending hardware health message: %s", hardwareHealthURL)
+	}
+	rv, err := ctrlClient.SendOnAllIntf(ctxWork, hardwareHealthURL, buf,
+		controllerconn.RequestOptions{
+			WithNetTracing: false,
+			BailOnHTTPErr:  false,
+			Iteration:      iteration,
+			SuppressLogs:   expectNoConn,
+		})
+	if err != nil {
+		// Hopefully next timeout will be more successful
+		if !expectNoConn {
+			log.Errorf("sendHardwareHealthProtobufByURL status %d failed: %s",
+				rv.Status, err)
+		}
+		return false
+	} else {
+		saveSentHardwareHealthProtoMessage(data)
+	}
+	return true
+}
+
+// sendHardwareHealthProtobuf serializes and sends the provided hardware health protobuf message
+// to the controller, and if a local controller configuration is present, also sends it asynchronously
+// to the local controller.
+//
+// Returns:
+//   - bool: true if the message was sent successfully to the primary controller, false otherwise.
+func sendHardwareHealthProtobuf(ctx *getconfigContext,
+	HardwareHealth *hardwarehealth.ZHardwareHealth, iteration int) bool {
+
+	url := controllerconn.URLPathString(serverNameAndPort, ctrlClient.UsingV2API(),
+		devUUID, "hardwarehealth")
+	ret := sendHardwareHealthProtobufByURL(ctx, url, HardwareHealth, iteration,
+		ctx.zedagentCtx.airgapMode)
+
+	locConfig := ctx.sideController.locConfig
+
+	// Repeat hardwarehealth for LOC as well
+	if locConfig != nil {
+		// Don't block current execution context
+		go func() {
+			url := controllerconn.URLPathString(locConfig.LocURL, ctrlClient.UsingV2API(),
+				devUUID, "hardwarehealth")
+			sendHardwareHealthProtobufByURL(ctx, url, HardwareHealth, iteration, false)
+		}()
+	}
+	return ret
 }
 
 // Use the ifname/vifname to find the AppNetAdapter status

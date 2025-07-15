@@ -5,7 +5,8 @@
 #
 EVE="$(cd "$(dirname "$0")" && pwd)/../"
 PATH="$EVE/build-tools/bin:$PATH"
-MKFLASH_TAG="$(linuxkit pkg show-tag "$EVE/pkg/$1")"
+# shellcheck disable=SC2086
+MKFLASH_TAG="$(linuxkit pkg ${LINUXKIT_ORG_TARGET} show-tag "$EVE/pkg/$1")"
 shift 1
 
 # Recreate image file
@@ -23,4 +24,4 @@ SOURCE="$(cd "$1" && pwd)"
 IMAGE="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
 shift 2
 
-docker run --rm -e DEBUG="$DEBUG" -v "$SOURCE:/parts" -v "$IMAGE:/output.img" "$MKFLASH_TAG" "$CREATE_IMG_ARG" /output.img "$@"
+docker run --rm -e DEBUG="$DEBUG" -e PLATFORM="$PLATFORM" -v "$SOURCE:/parts" -v "$IMAGE:/output.img" "$MKFLASH_TAG" "$CREATE_IMG_ARG" /output.img "$@"
