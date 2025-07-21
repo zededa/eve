@@ -502,7 +502,7 @@ These instructions show you how to install EVE or the installer onto an installa
 EVE is an operating system with installer with particular requirements for the storage on which it is installed.
 It installs to the entire medium. You must be careful to enter commands correctly and be sure the selected
 devices are correct. If you select the wrong target device, you can completely overwrite the main storage disk and operating
-system system you're running on, instead of the target storage device.
+system you're running on, instead of the target storage device.
 
 PROCEED AT YOUR OWN RISK
 
