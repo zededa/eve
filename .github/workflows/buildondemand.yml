@@ -50,7 +50,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: ensure zstd for cache  # this should be removed once the arm64 VM includes zstd
-        if: ${{ matrix.os == 'buildjet-4vcpu-ubuntu-2204-arm' || matrix.os == 'arm64-secure' }}
+        if: ${{ matrix.os == 'zededa-arm' }}
         run: |
           sudo apt install -y zstd
       - name: ensure packages for cross-arch build
@@ -140,7 +140,7 @@ jobs:
   manifest:
     # Only run for the default branch
     if: github.ref_name == github.event.repository.default_branch
-    runs-on: ubuntu-latest
+    runs-on: zededa-x64
     needs: packages
     steps:
       - uses: actions/checkout@v4
