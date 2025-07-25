@@ -22,17 +22,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [zededa-ubuntu-2204, zededa-ubuntu-2204-arm64]
+        os: [zededa-x64, zededa-arm]
         arch: [arm64, amd64]
         platform: [generic, nvidia-jp5, nvidia-jp6, evaluation]
         include:
-          - os: zededa-ubuntu-2204
+          - os: zededa-x64
             arch: riscv64
             platform: generic
         exclude:
-          - os: zededa-ubuntu-2204-arm64
+          - os: zededa-arm
             arch: amd64
-          - os: zededa-ubuntu-2204
+          - os: zededa-x64
             arch: arm64
           - arch: amd64
             platform: nvidia-jp5
@@ -60,16 +60,12 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
-      - name: Login to Docker Hub
-        if: ${{ github.event.repository.full_name }}== 'lf-edge/eve'
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_PULL_USER }}
-          password: ${{ secrets.DOCKERHUB_PULL_TOKEN }}
-      - name: ensure zstd for cache  # this should be removed once the arm64 VM includes zstd
-        if: ${{ matrix.os == 'buildjet-4vcpu-ubuntu-2204-arm' || matrix.os == 'arm64-secure' }}
-        run: |
-          sudo apt install -y zstd
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: ensure packages for cross-arch build
         if: ${{ matrix.arch == 'riscv64' }}
         run: |
@@ -86,6 +82,8 @@ jobs:
           path: ~/.linuxkit/cache
           key: linuxkit-${{ matrix.arch }}-${{ github.event.pull_request.head.sha }}-${{ matrix.platform }}
       - name: Build packages ${{ matrix.os }} for ${{ matrix.platform }}
+        env:
+          LINUXKIT_ORG: ghcr.io/${{ github.repository_owner }}
         run: |
           make V=1 PRUNE=1 PLATFORM=${{ matrix.platform }} ZARCH=${{ matrix.arch }} pkgs
       - name: Post package report
@@ -103,36 +101,36 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [zededa-ubuntu-2204, zededa-ubuntu-2204-arm64]
+        os: [zededa-x64, zededa-arm]
         arch: [arm64, amd64]
         hv: [xen, kvm, kubevirt]
         platform: ["generic"]
         include:
           - arch: riscv64
-            os: zededa-ubuntu-2204
+            os: zededa-x64
             hv: mini
             platform: "generic"
           - arch: amd64
-            os: zededa-ubuntu-2204
+            os: zededa-x64
             hv: kvm
             platform: "rt"
           - arch: arm64
-            os: zededa-ubuntu-2204-arm64
+            os: zededa-arm
             hv: kvm
             platform: "nvidia-jp5"
           - arch: arm64
-            os: zededa-ubuntu-2204-arm64
+            os: zededa-arm
             hv: kvm
             platform: "nvidia-jp6"
           - arch: amd64
-            os: zededa-ubuntu-2204
+            os: zededa-x64
             hv: kvm
             platform: "evaluation"
         exclude:
           - arch: arm64
-            os: zededa-ubuntu-2204
+            os: zededa-x64
           - arch: amd64
-            os: zededa-ubuntu-2204-arm64
+            os: zededa-arm
           - arch: arm64
             hv: kubevirt
             platform: "generic"
@@ -144,12 +142,12 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
 
-      - name: Login to Docker Hub
-        if: ${{ github.event.repository.full_name }}== 'lf-edge/eve'
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_PULL_USER }}
-          password: ${{ secrets.DOCKERHUB_PULL_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Arch Runner is Matrix
         id: arch_runner_equals_matrix
@@ -201,12 +199,24 @@ jobs:
         run: |
           COMMIT_ID=$(git describe --abbrev=8 --always)
           echo "VERSION=0.0.0-pr$PR_ID-$COMMIT_ID" >> $GITHUB_ENV
-          echo "TAG=evebuild/pr:$PR_ID" >> $GITHUB_ENV
+          echo "TAG=ghcr.io/${{ github.repository_owner }}/eve-pr:$PR_ID" >> $GITHUB_ENV
           echo "ARCH=${{ matrix.arch }}" >> "$GITHUB_ENV"
 
       - name: Build EVE ${{ matrix.hv }}-${{ matrix.arch }}-${{ matrix.platform }}
+        env:
+          LINUXKIT_ORG: ghcr.io/${{ github.repository_owner }}
         run: |
-          make V=1 ROOTFS_VERSION="$VERSION" PLATFORM=${{ matrix.platform }} HV=${{ matrix.hv }} ZARCH=${{ matrix.arch }} pkgs eve  # note that this already loads it into docker
+          # Build EVE and immediately tag it with GHCR format
+          make V=1 ROOTFS_VERSION="$VERSION" PLATFORM=${{ matrix.platform }} HV=${{ matrix.hv }} ZARCH=${{ matrix.arch }} pkgs eve
+          
+          # Tag the built image with GHCR format
+          BUILT_IMAGE="lfedge/eve:$VERSION-${{ matrix.hv }}"
+          GHCR_BASE_IMAGE="ghcr.io/${{ github.repository_owner }}/eve:$VERSION-${{ matrix.hv }}"
+          
+          # Re-tag the image if it was built with the old naming convention
+          if docker image inspect "$BUILT_IMAGE" >/dev/null 2>&1; then
+            docker tag "$BUILT_IMAGE" "$GHCR_BASE_IMAGE"
+          fi
       - name: Post eve build report
         run: |
           echo Disk usage
@@ -215,9 +225,20 @@ jobs:
           free -m
           docker system df
           docker system df -v
+      - name: Push to GitHub Container Registry
+        run: |
+          # Tag and push the EVE image to GitHub Container Registry
+          GHCR_IMAGE="ghcr.io/${{ github.repository_owner }}/eve:$VERSION-${{ matrix.hv }}-${{ matrix.arch }}-${{ matrix.platform }}"
+          docker tag "ghcr.io/${{ github.repository_owner }}/eve:$VERSION-${{ matrix.hv }}" "$GHCR_IMAGE"
+          docker push "$GHCR_IMAGE"
+          
+          # Also push with PR tag for easy identification
+          PR_TAG="ghcr.io/${{ github.repository_owner }}/eve:pr-${{ github.event.pull_request.number }}-${{ matrix.hv }}-${{ matrix.arch }}-${{ matrix.platform }}"
+          docker tag "ghcr.io/${{ github.repository_owner }}/eve:$VERSION-${{ matrix.hv }}" "$PR_TAG"
+          docker push "$PR_TAG"
       - name: Export docker container
         run: |
-          make cache-export ZARCH=${{ matrix.arch }} IMAGE=lfedge/eve:$VERSION-${{ matrix.hv }} OUTFILE=eve-${{ matrix.hv }}-${{ matrix.arch }}-${{ matrix.platform }}.tar IMAGE_NAME=$TAG-${{ matrix.hv }}-${{ matrix.arch }}
+          make cache-export ZARCH=${{ matrix.arch }} IMAGE=ghcr.io/${{ github.repository_owner }}/eve:$VERSION-${{ matrix.hv }} OUTFILE=eve-${{ matrix.hv }}-${{ matrix.arch }}-${{ matrix.platform }}.tar IMAGE_NAME=$TAG-${{ matrix.hv }}-${{ matrix.arch }}
       - name: Upload EVE ${{ matrix.hv }}-${{ matrix.arch }}-${{ matrix.platform }}
         uses: actions/upload-artifact@v4
         with:
@@ -226,7 +247,7 @@ jobs:
       - name: Clean EVE ${{ matrix.hv }}-${{ matrix.arch }}-${{ matrix.platform }}
         run: |
           make clean
-          docker rmi "$TAG-${{ matrix.hv }}-${{ matrix.arch }}" "lfedge/eve:$VERSION-${{ matrix.hv }}" "lfedge/eve:$VERSION-${{ matrix.hv }}-${{ matrix.arch }}" ||:
+          docker rmi "$TAG-${{ matrix.hv }}-${{ matrix.arch }}" "ghcr.io/${{ github.repository_owner }}/eve:$VERSION-${{ matrix.hv }}" "ghcr.io/${{ github.repository_owner }}/eve:$VERSION-${{ matrix.hv }}-${{ matrix.arch }}" ||:
       - name: Post clean eve ${{ matrix.hv }}-${{ matrix.arch }}-${{ matrix.platform }} report
         run: |
           echo Disk usage

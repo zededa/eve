@@ -426,9 +426,13 @@ ifeq ($(LINUXKIT_PKG_TARGET),push)
   EVE_REL:=$(EVE_REL)$(if $(TAGPLAT),-$(TAGPLAT),)
 endif
 
-# Check for a custom registry (used for development purposes)
+# Check for a custom registry/organization (used for development purposes)
 ifdef REGISTRY
 LINUXKIT_ORG_TARGET=--org $(REGISTRY)/lfedge
+export LINUXKIT_ORG_TARGET
+else ifdef LINUXKIT_ORG
+# Allow full control over the organization (e.g., LINUXKIT_ORG=ghcr.io/zededa)
+LINUXKIT_ORG_TARGET=--org $(LINUXKIT_ORG)
 export LINUXKIT_ORG_TARGET
 else
 LINUXKIT_ORG_TARGET=

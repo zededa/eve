@@ -1,5 +1,5 @@
 ---
-name: build and publish packages on demand
+name: build and publish images on demand
 on:  # yamllint disable-line rule:truthy
   workflow_dispatch:
     inputs:
@@ -26,11 +26,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: zededa-ubuntu-2204
+          - os: zededa-arm
             arch: arm64
-          - os: zededa-ubuntu-2204
+          - os: zededa-x64
             arch: amd64
-          - os: zededa-ubuntu-2204
+          - os: zededa-x64
             arch: riscv64
     steps:
       - name: Starting Report
@@ -66,11 +66,12 @@ jobs:
           path: ~/.linuxkit/cache
           key: linuxkit-${{ matrix.arch }}-${{ github.sha }}
       - name: Build packages
+        env:
+          LINUXKIT_ORG: ghcr.io/${{ github.repository_owner }}
         uses: ./.github/actions/run-make
         with:
           command: "V=1 PRUNE=1 ZARCH=${{ matrix.arch }} LINUXKIT_PKG_TARGET=push $FORCE_BUILD pkgs"
-          dockerhub-token: ${{ secrets.RELEASE_DOCKERHUB_TOKEN }}
-          dockerhub-account: ${{ secrets.RELEASE_DOCKERHUB_ACCOUNT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Post package report
         run: |
           echo Disk usage
@@ -84,7 +85,7 @@ jobs:
     needs: packages  # all packages for all platforms must be built first
     # Only run for the default branch
     if: github.ref_name == github.event.repository.default_branch
-    runs-on: zededa-ubuntu-2204
+    runs-on: zededa-x64
     strategy:
       fail-fast: false
       matrix:
@@ -129,14 +130,12 @@ jobs:
       - uses: ./.github/actions/run-make
         with:
           command: "V=1 HV=${{ matrix.hv }} PLATFORM=${{ matrix.platform }} ZARCH=${{ matrix.arch }} LINUXKIT_PKG_TARGET=push $FORCE_BUILD eve"
-          dockerhub-token: ${{ secrets.RELEASE_DOCKERHUB_TOKEN }}
-          dockerhub-account: ${{ secrets.RELEASE_DOCKERHUB_ACCOUNT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: ./.github/actions/run-make
         if: matrix.arch != 'riscv64'
         with:
           command: "V=1 HV=${{ matrix.hv }} PLATFORM=${{ matrix.platform }} ZARCH=${{ matrix.arch }} LINUXKIT_PKG_TARGET=push $FORCE_BUILD sbom collected_sources compare_sbom_collected_sources publish_sources"
-          dockerhub-token: ${{ secrets.RELEASE_DOCKERHUB_TOKEN }}
-          dockerhub-account: ${{ secrets.RELEASE_DOCKERHUB_ACCOUNT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   manifest:
     # Only run for the default branch
@@ -150,5 +149,4 @@ jobs:
       - uses: ./.github/actions/run-make
         with:
           command: "V=1 LINUXKIT_PKG_TARGET=manifest pkgs"
-          dockerhub-token: ${{ secrets.RELEASE_DOCKERHUB_TOKEN }}
-          dockerhub-account: ${{ secrets.RELEASE_DOCKERHUB_ACCOUNT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}

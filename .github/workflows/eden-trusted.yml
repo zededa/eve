@@ -121,11 +121,10 @@ jobs:
     needs: context
     runs-on: ubuntu-latest
     steps:
-      - name: Check Dockerhub credentials
+      - name: Check GitHub Container Registry access
         run: |
-          if [[ -z "${{ secrets.DOCKERHUB_PULL_USER }}" ]]; then
-            echo "Warning: DOCKERHUB_PULL_USER secret is not set. This may affect the ability to pull images from Docker Hub.";
-          fi
+          echo "Using GitHub Container Registry (ghcr.io) for container operations."
+          echo "GitHub token is automatically available for GHCR access."
 
   status_ui:
     name: Reset & Render Eden statuses

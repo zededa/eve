@@ -19,25 +19,25 @@ on:  # yamllint disable-line rule:truthy
 jobs:
   # 1) non-ARM packages, fully parallel
   packages-non-arm:
-    if: github.event.repository.full_name == 'lf-edge/eve'
+    # Automatically detects any repository - no hardcoded values needed!
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: zededa-ubuntu-2204
+          - os: zededa-x64
             arch: amd64
             platform: "generic"
             hv: kvm
-          - os: zededa-ubuntu-2204
+          - os: zededa-x64
             arch: amd64
             platform: "generic"
             hv: kubevirt
-          - os: zededa-ubuntu-2204
+          - os: zededa-x64
             arch: amd64
             platform: "evaluation"
             hv: kvm
-          - os: zededa-ubuntu-2204
+          - os: zededa-x64
             arch: riscv64
             platform: "generic"
             hv: mini
@@ -62,13 +62,15 @@ jobs:
         run: |
           echo "ARCH=${{ matrix.arch }}" >> "$GITHUB_ENV"
           echo "TAG=$(echo "$REF" | sed -e 's#^.*/##' -e 's#master#snapshot#' -e 's#main#snapshot#')" >> "$GITHUB_ENV"
-      - name: Login to Docker Hub (build)
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
-        if: ${{ github.event.repository.full_name }}== 'lf-edge/eve'
         with:
-          username: ${{ secrets.DOCKERHUB_PULL_USER }}
-          password: ${{ secrets.DOCKERHUB_PULL_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build packages
+        env:
+          LINUXKIT_ORG: ghcr.io/${{ github.repository_owner }}
         run: |
           SUCCESS=
           for i in 1 2 3; do
@@ -82,13 +84,9 @@ jobs:
             fi
           done
           if [ -z "$SUCCESS" ]; then echo "::error::failed to build packages" && exit 1; fi
-      - name: Login to Docker Hub (push)
-        uses: docker/login-action@v3
-        if: ${{ github.event.repository.full_name }}== 'lf-edge/eve'
-        with:
-          username: ${{ secrets.RELEASE_DOCKERHUB_ACCOUNT }}
-          password: ${{ secrets.RELEASE_DOCKERHUB_TOKEN }}
       - name: Push packages
+        env:
+          LINUXKIT_ORG: ghcr.io/${{ github.repository_owner }}
         run: |
           SUCCESS=
           for i in 1 2 3; do
@@ -120,7 +118,6 @@ jobs:
 
   # 2) ARM packages, serialized
   packages-arm:
-    if: github.event.repository.full_name == 'lf-edge/eve'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 1440  # It takes more time when building arm64 on an amd64 runner
     strategy:
@@ -128,13 +125,13 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          - os: zededa-ubuntu-2204-arm64
+          - os: zededa-arm
             arch: arm64
             platform: "generic"
-          - os: zededa-ubuntu-2204-arm64
+          - os: zededa-arm
             arch: arm64
             platform: "nvidia-jp5"
-          - os: zededa-ubuntu-2204-arm64
+          - os: zededa-arm
             arch: arm64
             platform: "nvidia-jp6"
     steps:
@@ -169,14 +166,16 @@ jobs:
           echo "ARCH=${{ matrix.arch }}" >> "$GITHUB_ENV"
           echo "TAG=$(echo "$REF" | sed -e 's#^.*/##' -e 's#master#snapshot#' -e 's#main#snapshot#')" >> "$GITHUB_ENV"
 
-      - name: Login to Docker Hub (build)
-        if: ${{ github.event.repository.full_name }}== 'lf-edge/eve'
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_PULL_USER }}
-          password: ${{ secrets.DOCKERHUB_PULL_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build packages
+        env:
+          LINUXKIT_ORG: ghcr.io/${{ github.repository_owner }}
         run: |
           SUCCESS=
           # sadly, our build sometimes times out on network access
@@ -196,13 +195,9 @@ jobs:
              fi
           done
           if [ -z "$SUCCESS" ]; then echo "::error::failed to build packages" && exit 1; fi
-      - name: Login to Docker Hub (push)
-        if: ${{ github.event.repository.full_name }}== 'lf-edge/eve'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.RELEASE_DOCKERHUB_ACCOUNT }}
-          password: ${{ secrets.RELEASE_DOCKERHUB_TOKEN }}
       - name: Push packages
+        env:
+          LINUXKIT_ORG: ghcr.io/${{ github.repository_owner }}
         run: |
           SUCCESS=
           # sadly, our build sometimes times out on network access
@@ -240,9 +235,8 @@ jobs:
 
   # 3) downstream jobs depend on both package jobs
   eve:
-    if: github.event.repository.full_name == 'lf-edge/eve'
     needs: [packages-non-arm, packages-arm]
-    runs-on: zededa-ubuntu-2204
+    runs-on: zededa-x64
     strategy:
       fail-fast: false
       matrix:
@@ -274,22 +268,19 @@ jobs:
         uses: ./.github/actions/run-make
         with:
           command: "V=1 HV=${{ matrix.hv }} ZARCH=${{ matrix.arch }} PLATFORM=${{ matrix.platform }} LINUXKIT_PKG_TARGET=build eve"
-          dockerhub-token: ${{ secrets.DOCKERHUB_PULL_TOKEN }}
-          dockerhub-account: ${{ secrets.DOCKERHUB_PULL_USER }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           clean: false
       - name: Push EVE
         uses: ./.github/actions/run-make
         with:
           command: "V=1 HV=${{ matrix.hv }} ZARCH=${{ matrix.arch }} PLATFORM=${{ matrix.platform }} LINUXKIT_PKG_TARGET=push eve"
-          dockerhub-token: ${{ secrets.RELEASE_DOCKERHUB_TOKEN }}
-          dockerhub-account: ${{ secrets.RELEASE_DOCKERHUB_ACCOUNT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Collect and push SBOM and sources
         uses: ./.github/actions/run-make
         if: matrix.arch != 'riscv64'
         with:
           command: "V=1 HV=${{ matrix.hv }} ZARCH=${{ matrix.arch }} PLATFORM=${{ matrix.platform }} LINUXKIT_PKG_TARGET=push sbom collected_sources compare_sbom_collected_sources publish_sources"
-          dockerhub-token: ${{ secrets.RELEASE_DOCKERHUB_TOKEN }}
-          dockerhub-account: ${{ secrets.RELEASE_DOCKERHUB_ACCOUNT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Clean
         if: ${{ always() }}
         run: |
@@ -299,9 +290,8 @@ jobs:
           rm -rf ~/.linuxkit || :
 
   manifest:
-    if: github.event.repository.full_name == 'lf-edge/eve'
     needs: [packages-non-arm, packages-arm]
-    runs-on: zededa-ubuntu-2204
+    runs-on: zededa-x64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -309,15 +299,11 @@ jobs:
       - uses: ./.github/actions/run-make
         with:
           command: "V=1 LINUXKIT_PKG_TARGET=manifest pkgs"
-          dockerhub-token: ${{ secrets.RELEASE_DOCKERHUB_TOKEN }}
-          dockerhub-account: ${{ secrets.RELEASE_DOCKERHUB_ACCOUNT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   trigger_assets:
-    if: ${{ (startsWith(github.ref, 'refs/tags/')) && (github.event.repository.full_name == 'lf-edge/eve') }}
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     needs: [manifest, eve]
-    uses: lf-edge/eve/.github/workflows/assets.yml@master
-    secrets:
-      DOCKERHUB_PULL_TOKEN: ${{ secrets.DOCKERHUB_PULL_TOKEN }}
-      DOCKERHUB_PULL_USER: ${{ secrets.DOCKERHUB_PULL_USER }}
+    uses: ./.github/workflows/assets.yml
     with:
       tag_ref: ${{ github.ref_name }}
