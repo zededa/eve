@@ -34,27 +34,36 @@ jobs:
           echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
           echo "upload_url=$upload_url" >> "$GITHUB_OUTPUT"
   build:
-    runs-on: zededa-x64
+    runs-on: ${{ matrix.os }}
     needs: create_release
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
-        platform: ["generic"]
-        hv: ["kvm"]
         include:
-          - arch: arm64
-            platform: "nvidia-jp5"
-            hv: "kvm"
-          - arch: arm64
-            platform: "nvidia-jp6"
-            hv: "kvm"
-          - arch: amd64
+          - os: zededa-x64
+            arch: amd64
             platform: "generic"
-            hv: "kubevirt"
-          - arch: amd64
+            hv: kvm
+          - os: zededa-x64
+            arch: amd64
+            platform: "generic"
+            hv: kubevirt
+          - os: zededa-x64
+            arch: amd64
             platform: "evaluation"
-            hv: "kvm"
+            hv: kvm
+          - os: zededa-arm
+            arch: arm64
+            platform: "generic"
+            hv: kvm
+          - os: zededa-arm
+            arch: arm64
+            platform: "nvidia-jp5"
+            hv: kvm
+          - os: zededa-arm
+            arch: arm64
+            platform: "nvidia-jp6"
+            hv: kvm
     steps:
       - name: checkout repo
         uses: actions/checkout@v4
