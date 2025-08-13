@@ -1,0 +1,18 @@
+# Standard docker ignore patterns
+**/.git
+**/.gitignore
+**/.vscode
+**/node_modules
+**/coverage
+**/.env
+**/README.md
+**/Dockerfile.dev
+**/docker-compose*
+**/Makefile
+**/.travis.yml
+**/.nyc_output
+**/coverage
+**/LICENSE
+**/README.md
+**/target
+**/*.md

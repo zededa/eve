@@ -1,0 +1,12 @@
+kernel:
+  image: lfedge/eve-kernel:lts-4000e9a2c4c16b1996a46ba1c0e9bae4b00ad3cc-kvm-amd64
+  cmdline: "root=/dev/sda2 rootfstype=squashfs rd.splash=silent rd.systemd.show_status=false rd.udev.log-priority=3 biosdevname=0 net.ifnames=0 console=ttyS0 console=ttyS1 console=ttyAMA0 console=ttyAMA1 console=tty0 systemd.log_target=null quiet"
+init:
+  - lfedge/eve-hardware-model:latest
+trust:
+  org:
+    - lfedge
+files:
+  - path: etc/eve-release
+    contents: |
+      RELEASE_VERSION="snapshot"
