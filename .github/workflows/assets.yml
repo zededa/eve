@@ -56,6 +56,9 @@ jobs:
           - arch: arm64
             platform: "nvidia-jp6"
             hv: "kvm"
+          - arch: arm64
+            platform: "nvidia-spark"
+            hv: "kvm"
           - arch: amd64
             platform: "generic"
             hv: "k"

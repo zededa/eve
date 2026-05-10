@@ -250,7 +250,7 @@ prepare_for_platform() {
         cp /bits/bsp-imx/"$PLATFORM"-flash.bin /bits/imx8-flash.bin
         [ -n "$(ls /bits/bsp-imx/*.dtb 2> /dev/null)" ] && cp /bits/bsp-imx/*.dtb /bits/boot
         ;;
-    nvidia-jp*)
+    nvidia-jp*|nvidia-spark)
         DEFAULT_LIVE_IMG_SIZE=$DEFAULT_NVIDIA_LIVE_IMG_SIZE
         DEFAULT_INSTALLER_IMG_SIZE=$DEFAULT_NVIDIA_INSTALLER_IMG_SIZE
         ;;

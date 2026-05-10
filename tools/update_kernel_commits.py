@@ -238,6 +238,10 @@ if PYTEST_AVAILABLE:
             branch_commit_to_variable("eve-kernel-arm64-v5.10-nvidia-jp5", "abcd")
             == "KERNEL_COMMIT_arm64_v5.10_nvidia-jp5 = abcd\n"
         )
+        assert (
+            branch_commit_to_variable("eve-kernel-arm64-v6.14-nvidia-spark", "abcd")
+            == "KERNEL_COMMIT_arm64_v6.14_nvidia-spark = abcd\n"
+        )
         # Next branches always use generic flavor
         assert (
             branch_commit_to_variable("eve-kernel-amd64-next", "abcd")
@@ -273,6 +277,7 @@ if PYTEST_AVAILABLE:
         assert is_valid_branch_format("eve-kernel-riscv64-v5.10.192-nvidia-jp5") is True
         assert is_valid_branch_format("eve-kernel-arm64-v5.10-nvidia-jp5") is True
         assert is_valid_branch_format("eve-kernel-arm64-v5.10-nvidia-jp5") is True
+        assert is_valid_branch_format("eve-kernel-arm64-v6.14-nvidia-spark") is True
         assert is_valid_branch_format("eve-kernel-amd64-next") is True
         assert is_valid_branch_format("eve-kernel-arm64-next") is True
         assert is_valid_branch_format("eve-kernel-riscv64-next") is True

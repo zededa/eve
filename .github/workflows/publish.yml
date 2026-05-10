@@ -134,6 +134,9 @@ jobs:
           - os: zededa-ubuntu-2204-arm64
             arch: arm64
             platform: "nvidia-jp6"
+          - os: zededa-ubuntu-2204-arm64
+            arch: arm64
+            platform: "nvidia-spark"
     steps:
       - name: Starting Report
         run: |
@@ -245,6 +248,9 @@ jobs:
           - arch: arm64
             hv: kvm
             platform: "nvidia-jp6"
+          - arch: arm64
+            hv: kvm
+            platform: "nvidia-spark"
           - arch: amd64
             hv: k
             platform: "generic"

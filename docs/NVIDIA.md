@@ -56,6 +56,16 @@ Currently EVE supports the following devices based on the NVIDIA's Jetson Xavier
 
 See [NVIDIA-NX.md](./NVIDIA-NX.md) for instructions on how to build and deploy EVE on these devices.
 
+## How to use on a DGX Spark device
+
+DGX Spark (GB10 Grace Blackwell) is a desktop AI computer using a UEFI arm64
+boot flow and the NVIDIA datacenter driver/CUDA stack — distinct from the
+Jetpack/L4T family used by the Jetson modules above. EVE support is
+**experimental scaffolding**: the platform builds and boots, but GPU userspace
+and KVM passthrough are not yet wired up. See
+[NVIDIA-SPARK.md](./NVIDIA-SPARK.md) for status, build instructions, and the
+porting roadmap.
+
 ## How to use on a Jetson Thor device
 
 EVE supports Nvidia Jetpack 7.1 on the [Jetson Thor device](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-thor/). The installation process is pretty standard:

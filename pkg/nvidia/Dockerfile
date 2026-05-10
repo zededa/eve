@@ -32,10 +32,12 @@ FROM build-base AS amd64-generic
 FROM build-base AS amd64-nvidia-jp5
 FROM build-base AS amd64-nvidia-jp6
 FROM build-base AS amd64-nvidia-jp7
+FROM build-base AS amd64-nvidia-spark
 FROM build-base AS riscv64-generic
 FROM build-base AS riscv64-nvidia-jp5
 FROM build-base AS riscv64-nvidia-jp6
 FROM build-base AS riscv64-nvidia-jp7
+FROM build-base AS riscv64-nvidia-spark
 
 FROM build-base AS arm64-nvidia-jp5
 ENV JETSON_LINUX=${JETSON_JP5}
@@ -49,6 +51,14 @@ FROM build-base AS arm64-nvidia-jp7
 ENV JETSON_LINUX=${JETSON_JP7}
 ENV JETPACK_VER=jp7
 
+# DGX Spark (GB10) — UEFI arm64, datacenter driver stack, no L4T tarball.
+# JETSON_LINUX is set to a small placeholder URL because the ADD directive
+# below cannot be conditional; the file is not used (extraction is gated
+# by JETPACK_VER below).
+FROM build-base AS arm64-nvidia-spark
+ENV JETSON_LINUX=https://raw.githubusercontent.com/lf-edge/eve/master/LICENSE
+ENV JETPACK_VER=spark
+
 FROM ${TARGETARCH}-${PLATFORM} AS build
 
 RUN echo "${EVE_PLATFORM}" > /eve-platform
@@ -58,9 +68,9 @@ COPY cdi/${JETPACK_VER} /cdi
 
 ADD ${JETSON_LINUX} /jetson_linux.tbz2
 
-# Extract tarball
+# Extract tarball (skip on platforms without an L4T BSP, e.g. nvidia-spark)
 WORKDIR /
-RUN tar -xjf /jetson_linux.tbz2
+RUN if [ "${JETPACK_VER}" != "spark" ]; then tar -xjf /jetson_linux.tbz2; fi
 
 # Build nvidia-ctk
 ENV NVIDIA_CONTAINER_TOOLKIT_REV=v1.16.2

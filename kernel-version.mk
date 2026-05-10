@@ -21,7 +21,7 @@ KERNEL_COMPILER=gcc
 KERNEL_CONFIG_FLAVOR ?=
 
 PLATFORMS_amd64=generic rt evaluation
-PLATFORMS_arm64=generic nvidia-jp5 nvidia-jp6 nvidia-jp7 imx8mp_pollux imx8mp_epc_r3720 imx8mq_evk
+PLATFORMS_arm64=generic nvidia-jp5 nvidia-jp6 nvidia-jp7 nvidia-spark imx8mp_pollux imx8mp_epc_r3720 imx8mq_evk
 PLATFORMS_riscv64=generic
 ARCHS=amd64 arm64 riscv64
 
@@ -47,6 +47,14 @@ ifeq ($(ZARCH), amd64)
     endif
 else ifeq ($(ZARCH), arm64)
     ifeq (, $(findstring nvidia,$(PLATFORM)))
+        KERNEL_FLAVOR=generic
+        KERNEL_VERSION=v6.1.155
+    else ifeq ($(PLATFORM),nvidia-spark)
+        # Stage 1 scaffold: DGX Spark has no dedicated eve-kernel branch yet.
+        # Reuse the generic arm64 kernel so builds complete; this kernel will
+        # not include the GB10/Blackwell datacenter driver. Replace with a
+        # `eve-kernel-arm64-v<X.Y>-nvidia-spark` branch once the kernel work
+        # in Stage 3 lands.
         KERNEL_FLAVOR=generic
         KERNEL_VERSION=v6.1.155
     else
