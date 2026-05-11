@@ -1,0 +1,11 @@
+# DRAFT udev rules for NVIDIA DGX Spark (GB10).
+# Datacenter driver creates /dev/nvidia{0,ctl,-modeset,-uvm,-uvm-tools} and
+# /dev/nvidia-caps/* nodes. Validate on real hardware against the output of
+# `udevadm info /dev/nvidia0`.
+KERNEL=="nvidia",       MODE="0666"
+KERNEL=="nvidiactl",    MODE="0666"
+KERNEL=="nvidia[0-9]*", MODE="0666"
+KERNEL=="nvidia-modeset", MODE="0666"
+KERNEL=="nvidia-uvm",   MODE="0666"
+KERNEL=="nvidia-uvm-tools", MODE="0666"
+SUBSYSTEM=="nvidia-caps", MODE="0666"

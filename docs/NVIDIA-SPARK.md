@@ -41,20 +41,43 @@ to a USB stick. Spark's UEFI should pick it up from the boot menu.
 
 ## Roadmap
 
-- **Stage 1 (this commit)** — `nvidia-spark` PLATFORM scaffold. Empty
-  `pkg/nvidia/cdi/spark/` and `udev/spark/rules.d/`. L4T tarball extraction is
-  skipped. The build produces an EVE image with the platform marker but no
-  GPU userspace.
-- **Stage 2 — GPU userspace.** Extract the NVIDIA datacenter driver and CUDA
-  runtime from a working DGX OS install, generate a CDI spec on real hardware
-  with `nvidia-ctk cdi generate`, and bundle the libs under
-  `/opt/vendor/nvidia/`. Replaces the empty `cdi/spark/` and `udev/spark/`.
-- **Stage 3 — Kernel.** Decide between forking Ubuntu HWE 6.14 with the NVIDIA
-  arm64 patches into [eve-kernel](https://github.com/lf-edge/eve-kernel)
-  (`eve-kernel-arm64-v6.14-nvidia-spark`) or tracking DGX OS's kernel directly.
-- **Stage 4 — Virtualization.** Determine whether GPU passthrough is achievable
-  or whether the port must be Kubernetes-only (`HV=k`) until NVIDIA enables
-  it.
+- **Stage 1 — Platform scaffold.** `nvidia-spark` PLATFORM wired into the
+  Makefile, linuxkit build templates, modifier yq, runme.sh, and CI matrices.
+  L4T tarball extraction gated off for spark. ✅
+- **Stage 2 — GPU userspace (draft).** Draft CDI spec at
+  [pkg/nvidia/cdi/spark/dgx-spark.yaml](../pkg/nvidia/cdi/spark/dgx-spark.yaml)
+  modelled on the NVIDIA datacenter arm64 driver layout. Driver extractor at
+  [pkg/nvidia/scripts/spark/extract-driver.sh](../pkg/nvidia/scripts/spark/extract-driver.sh)
+  fetches the arm64 SBSA CUDA repo. `process-cdi.sh` accepts a pre-populated
+  rootfs so spark skips the L4T `Linux_for_Tegra/` extraction. ✅ (needs
+  hardware validation — see below)
+- **Stage 3 — Kernel (gated).** [kernel-commits.mk](../kernel-commits.mk)
+  carries a placeholder slot for `eve-kernel-arm64-v6.14-nvidia-spark`.
+  Builds use the generic arm64 kernel by default; set `NVIDIA_SPARK_KERNEL=1`
+  to opt into the dedicated branch once it exists. ✅ scaffolding,
+  ⚠ blocked on actual eve-kernel branch
+- **Stage 4 — Virtualization.** No pillar code changes required: PCIe
+  passthrough goes through generic vfio-pci binding in
+  [pkg/pillar/hypervisor/hypervisor.go](../pkg/pillar/hypervisor/hypervisor.go).
+  ✅ confirmed platform-agnostic. ⚠ NVIDIA forums still report KVM GPU
+  passthrough is broken on Spark as of 2026-Q2; recommended initial mode is
+  `HV=k` (bare-metal Kubernetes).
+
+## Hardware validation checklist
+
+Items that need a real Spark to confirm:
+
+1. **CDI spec** — run `nvidia-ctk cdi generate --output /tmp/spark.yaml` on
+   DGX OS and diff against
+   [pkg/nvidia/cdi/spark/dgx-spark.yaml](../pkg/nvidia/cdi/spark/dgx-spark.yaml).
+   Replace versioned suffixes (`580.00`, `12.6`) with what `nvidia-smi` and
+   `nvcc --version` report.
+2. **udev rules** — run `udevadm info /dev/nvidia0` and confirm the rules in
+   [pkg/nvidia/udev/spark/rules.d/](../pkg/nvidia/udev/spark/rules.d/) match.
+3. **Boot test** — `make ZARCH=arm64 HV=kvm PLATFORM=nvidia-spark live-raw`,
+   flash, boot, capture serial output.
+4. **GPU bringup** — once booted, `modprobe nvidia && nvidia-smi` from the
+   debug shell to confirm the bundled userspace works.
 
 ## Open questions / blockers
 

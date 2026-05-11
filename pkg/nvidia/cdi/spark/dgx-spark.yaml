@@ -1,0 +1,81 @@
+---
+# DRAFT CDI specification for NVIDIA DGX Spark (GB10 Grace Blackwell).
+#
+# Generated from the layout of the NVIDIA datacenter open-gpu-kernel-module
+# (open-kernel) driver + CUDA arm64 SBSA distribution. **Not validated on
+# real hardware yet.** Once `nvidia-ctk cdi generate` is run on a real Spark
+# DGX OS install this file MUST be replaced with the generated output.
+#
+# Differences from the Jetson (L4T) CDI specs in ../jp{5,6,7}/:
+#   - No Tegra device nodes (/dev/nvmap, /dev/nvsciipc, /dev/host1x-fence,
+#     /dev/nvhost-*). Spark uses the datacenter driver, not L4T.
+#   - Library paths live directly under /usr/lib/aarch64-linux-gnu/, not
+#     under /usr/lib/aarch64-linux-gnu/nvidia/.
+#   - Driver version placeholder is "580.00" — update after running
+#     `nvidia-smi --query-gpu=driver_version --format=csv,noheader`.
+cdiVersion: 0.5.0
+kind: nvidia.com/gpu
+devices:
+  - name: '0'
+    containerEdits:
+      deviceNodes:
+        - path: /dev/nvidia0
+        - path: /dev/nvidiactl
+        - path: /dev/nvidia-modeset
+        - path: /dev/nvidia-uvm
+        - path: /dev/nvidia-uvm-tools
+        - path: /dev/nvidia-caps/nvidia-cap1
+        - path: /dev/nvidia-caps/nvidia-cap2
+        - path: /dev/dri/card0
+        - path: /dev/dri/renderD128
+      hooks:
+        - hookName: createContainer
+          path: /usr/bin/nvidia-cdi-hook
+          args:
+            - nvidia-cdi-hook
+            - create-symlinks
+            - '--link'
+            - 'libcuda.so.1::/usr/lib/aarch64-linux-gnu/libcuda.so'
+            - '--link'
+            - 'libnvidia-ml.so.1::/usr/lib/aarch64-linux-gnu/libnvidia-ml.so'
+            - '--link'
+            - 'libnvidia-opticalflow.so.1::/usr/lib/aarch64-linux-gnu/libnvidia-opticalflow.so'
+          env:
+            - NVIDIA_CTK_DEBUG=false
+        - hookName: createContainer
+          path: /usr/bin/nvidia-cdi-hook
+          args:
+            - nvidia-cdi-hook
+            - update-ldcache
+            - '--folder'
+            - /usr/lib/aarch64-linux-gnu
+          env:
+            - NVIDIA_CTK_DEBUG=false
+containerEdits:
+  hooks: []
+  mounts:
+    # Driver libraries — paths reflect the datacenter NVIDIA driver layout
+    # on arm64 Ubuntu 24.04 (DGX OS 7). Update versioned suffixes to match
+    # the actual installed driver.
+    - hostPath: /usr/lib/aarch64-linux-gnu/libcuda.so.580.00
+      containerPath: /usr/lib/aarch64-linux-gnu/libcuda.so.580.00
+      options: ["ro", "nosuid", "nodev", "bind"]
+    - hostPath: /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.580.00
+      containerPath: /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.580.00
+      options: ["ro", "nosuid", "nodev", "bind"]
+    - hostPath: /usr/lib/aarch64-linux-gnu/libnvidia-ptxjitcompiler.so.580.00
+      containerPath: /usr/lib/aarch64-linux-gnu/libnvidia-ptxjitcompiler.so.580.00
+      options: ["ro", "nosuid", "nodev", "bind"]
+    - hostPath: /usr/lib/aarch64-linux-gnu/libnvidia-nvvm.so.580.00
+      containerPath: /usr/lib/aarch64-linux-gnu/libnvidia-nvvm.so.580.00
+      options: ["ro", "nosuid", "nodev", "bind"]
+    - hostPath: /usr/lib/aarch64-linux-gnu/libnvidia-opticalflow.so.580.00
+      containerPath: /usr/lib/aarch64-linux-gnu/libnvidia-opticalflow.so.580.00
+      options: ["ro", "nosuid", "nodev", "bind"]
+    # Binaries
+    - hostPath: /usr/bin/nvidia-smi
+      containerPath: /usr/bin/nvidia-smi
+      options: ["ro", "nosuid", "nodev", "bind"]
+    - hostPath: /usr/bin/nvidia-debugdump
+      containerPath: /usr/bin/nvidia-debugdump
+      options: ["ro", "nosuid", "nodev", "bind"]

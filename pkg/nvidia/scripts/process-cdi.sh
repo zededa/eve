@@ -8,6 +8,15 @@
 # the destination location.
 
 extract_debs() {
+    # L4T tarball case: extract every .deb from the Jetson Linux release.
+    # For non-L4T platforms (e.g. nvidia-spark) the Linux_for_Tegra directory
+    # is absent and the caller is expected to populate "$1" beforehand
+    # (typically via pkg/nvidia/scripts/<platform>/extract-driver.sh).
+    if [ ! -d Linux_for_Tegra/nv_tegra/l4t_deb_packages/ ]; then
+        echo "process-cdi.sh: no Linux_for_Tegra tree found; assuming"
+        echo "                rootfs '$1' was populated by an external extractor."
+        return 0
+    fi
     DEBS=$(find Linux_for_Tegra/nv_tegra/l4t_deb_packages/ -type f -name "*.deb")
     for x in $DEBS; do
         dpkg -x "$x" "$1"

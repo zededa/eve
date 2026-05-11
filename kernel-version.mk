@@ -50,13 +50,20 @@ else ifeq ($(ZARCH), arm64)
         KERNEL_FLAVOR=generic
         KERNEL_VERSION=v6.1.155
     else ifeq ($(PLATFORM),nvidia-spark)
-        # Stage 1 scaffold: DGX Spark has no dedicated eve-kernel branch yet.
-        # Reuse the generic arm64 kernel so builds complete; this kernel will
-        # not include the GB10/Blackwell datacenter driver. Replace with a
-        # `eve-kernel-arm64-v<X.Y>-nvidia-spark` branch once the kernel work
-        # in Stage 3 lands.
-        KERNEL_FLAVOR=generic
-        KERNEL_VERSION=v6.1.155
+        # DGX Spark (GB10) — two modes:
+        #   default: reuse the generic arm64 kernel (no NVIDIA datacenter
+        #            driver patches). Image is bootable but lacks GPU.
+        #   NVIDIA_SPARK_KERNEL=1: use the dedicated
+        #            `eve-kernel-arm64-v6.14-nvidia-spark` branch. Requires
+        #            that branch to exist in lf-edge/eve-kernel with a real
+        #            commit registered in kernel-commits.mk.
+        ifeq ($(NVIDIA_SPARK_KERNEL),1)
+            KERNEL_FLAVOR=nvidia-spark
+            KERNEL_VERSION=v6.14
+        else
+            KERNEL_FLAVOR=generic
+            KERNEL_VERSION=v6.1.155
+        endif
     else
         KVER_nvidia=v5.10.192
         KVER_nvidia-jp5=v5.10.192

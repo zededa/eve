@@ -112,6 +112,11 @@ COPY scripts/${JETPACK_VER}/* /
 WORKDIR /
 RUN mkdir -p /ldconfig-bin /nvfanctrl/dist /nvct/dist /cdi /rootfs-dist /cdi-dist /rules.d && \
     mkdir -p /rootfs && \
+    # For non-L4T platforms (e.g. nvidia-spark), populate /rootfs from the
+    # NVIDIA arm64 SBSA datacenter driver repo before CDI processing.
+    if [ "${JETPACK_VER}" = "spark" ] && [ -x /extract-driver.sh ]; then \
+        /extract-driver.sh /rootfs || true ; \
+    fi && \
     if [ -n "$(ls /cdi/* 2> /dev/null)" ]; then \
         for x in /cdi/*.yaml; do \
             OUTFILE=/cdi-dist/$(basename "$x") ; \
