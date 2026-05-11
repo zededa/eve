@@ -1,18 +1,18 @@
 ---
-# DRAFT CDI specification for NVIDIA DGX Spark (GB10 Grace Blackwell).
+# CDI specification for NVIDIA DGX Spark (GB10 Grace Blackwell).
 #
-# Generated from the layout of the NVIDIA datacenter open-gpu-kernel-module
-# (open-kernel) driver + CUDA arm64 SBSA distribution. **Not validated on
-# real hardware yet.** Once `nvidia-ctk cdi generate` is run on a real Spark
-# DGX OS install this file MUST be replaced with the generated output.
+# Library filenames here were validated against an actual extraction of the
+# NVIDIA arm64 SBSA repo (see pkg/nvidia/scripts/spark/extract-driver.sh) at
+# driver branch 580. The device-node list still needs to be confirmed against
+# real Spark hardware via `nvidia-ctk cdi generate`.
 #
 # Differences from the Jetson (L4T) CDI specs in ../jp{5,6,7}/:
 #   - No Tegra device nodes (/dev/nvmap, /dev/nvsciipc, /dev/host1x-fence,
 #     /dev/nvhost-*). Spark uses the datacenter driver, not L4T.
 #   - Library paths live directly under /usr/lib/aarch64-linux-gnu/, not
 #     under /usr/lib/aarch64-linux-gnu/nvidia/.
-#   - Driver version placeholder is "580.00" — update after running
-#     `nvidia-smi --query-gpu=driver_version --format=csv,noheader`.
+#   - Driver version 580.65.06 matches the extract-driver.sh
+#     NVIDIA_DRIVER_BRANCH=580 default; bump in lockstep when upgrading.
 cdiVersion: 0.5.0
 kind: nvidia.com/gpu
 devices:
@@ -57,20 +57,20 @@ containerEdits:
     # Driver libraries — paths reflect the datacenter NVIDIA driver layout
     # on arm64 Ubuntu 24.04 (DGX OS 7). Update versioned suffixes to match
     # the actual installed driver.
-    - hostPath: /usr/lib/aarch64-linux-gnu/libcuda.so.580.00
-      containerPath: /usr/lib/aarch64-linux-gnu/libcuda.so.580.00
+    - hostPath: /usr/lib/aarch64-linux-gnu/libcuda.so.580.65.06
+      containerPath: /usr/lib/aarch64-linux-gnu/libcuda.so.580.65.06
       options: ["ro", "nosuid", "nodev", "bind"]
-    - hostPath: /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.580.00
-      containerPath: /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.580.00
+    - hostPath: /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.580.65.06
+      containerPath: /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.580.65.06
       options: ["ro", "nosuid", "nodev", "bind"]
-    - hostPath: /usr/lib/aarch64-linux-gnu/libnvidia-ptxjitcompiler.so.580.00
-      containerPath: /usr/lib/aarch64-linux-gnu/libnvidia-ptxjitcompiler.so.580.00
+    - hostPath: /usr/lib/aarch64-linux-gnu/libnvidia-ptxjitcompiler.so.580.65.06
+      containerPath: /usr/lib/aarch64-linux-gnu/libnvidia-ptxjitcompiler.so.580.65.06
       options: ["ro", "nosuid", "nodev", "bind"]
-    - hostPath: /usr/lib/aarch64-linux-gnu/libnvidia-nvvm.so.580.00
-      containerPath: /usr/lib/aarch64-linux-gnu/libnvidia-nvvm.so.580.00
+    - hostPath: /usr/lib/aarch64-linux-gnu/libnvidia-nvvm.so.580.65.06
+      containerPath: /usr/lib/aarch64-linux-gnu/libnvidia-nvvm.so.580.65.06
       options: ["ro", "nosuid", "nodev", "bind"]
-    - hostPath: /usr/lib/aarch64-linux-gnu/libnvidia-opticalflow.so.580.00
-      containerPath: /usr/lib/aarch64-linux-gnu/libnvidia-opticalflow.so.580.00
+    - hostPath: /usr/lib/aarch64-linux-gnu/libnvidia-opticalflow.so.580.65.06
+      containerPath: /usr/lib/aarch64-linux-gnu/libnvidia-opticalflow.so.580.65.06
       options: ["ro", "nosuid", "nodev", "bind"]
     # Binaries
     - hostPath: /usr/bin/nvidia-smi

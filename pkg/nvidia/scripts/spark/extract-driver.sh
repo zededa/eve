@@ -45,12 +45,19 @@ PACKAGES="
 WORK=$(mktemp -d)
 cd "$WORK"
 
-# Fetch the package index
-curl -fsSL "${REPO_URL}/Packages" -o Packages || {
+# Fetch the package index. If this fails inside `linuxkit pkg build` it is
+# almost always because the buildkit RUN sandbox lacks DNS (a known Docker
+# Desktop quirk — `ADD <url>` in the Dockerfile works because buildkit uses
+# the host network for ADD, but RUN runs in its sandbox). Workaround for
+# local builds: invoke `docker buildx build --network=host ...` directly,
+# or run on a Linux CI host where buildkit RUN has working DNS.
+if ! curl -fsSL "${REPO_URL}/Packages" -o Packages; then
     echo "WARN: cannot fetch NVIDIA arm64 SBSA package index — skipping."
     echo "      The Spark image will be built without GPU userspace."
+    echo "      If this is a 'Could not resolve host' error from buildkit,"
+    echo "      rebuild with: docker buildx build --network=host ..."
     exit 0
-}
+fi
 
 # Resolve and download each package
 for pkg in $PACKAGES; do

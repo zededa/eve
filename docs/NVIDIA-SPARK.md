@@ -22,6 +22,23 @@ Xavier/Orin.
 | KVM GPU passthrough | Supported on Jetpack 5/6/7 | Not officially supported as of 2026-Q2 |
 | MIG / vGPU | No | No |
 
+## Local build notes
+
+The Stage 2 driver extractor
+([pkg/nvidia/scripts/spark/extract-driver.sh](../pkg/nvidia/scripts/spark/extract-driver.sh))
+fetches the NVIDIA arm64 SBSA repo at RUN time. On **Linux CI hosts** this
+works out of the box. On **Docker Desktop for macOS/Windows** the buildkit
+RUN sandbox typically lacks DNS, so the fetch falls back to a no-GPU-userspace
+build — verified working in this repo when bypassed with:
+
+```sh
+docker buildx build --network=host --platform linux/arm64 \
+  --build-arg PLATFORM=nvidia-spark --target build pkg/nvidia
+```
+
+(Tested 2026-05: produced a 206 MB `/rootfs-dist/` containing
+`libcuda.so.580.65.06`, `libnvidia-ml.so.580.65.06`, `nvidia-smi`, etc.)
+
 ## Building
 
 > **Stage 1 only:** This produces a bootable EVE arm64 UEFI image with the
