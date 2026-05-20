@@ -1,0 +1,31 @@
+{
+    "Version": 1,
+    "Key": "bootstrap",
+    "TimePriority": "0001-01-01T00:00:00Z",
+    "Ports": [
+        {
+            "IfName": "usb0",
+            "Name": "USB-CDC-ECM",
+            "IsMgmt": true,
+            "IsL3Port": true,
+            "Dhcp": 4,
+            "Free": true
+        },
+        {
+            "IfName": "eth0",
+            "Name": "Management1",
+            "IsMgmt": true,
+            "IsL3Port": true,
+            "Dhcp": 4,
+            "Free": true
+        },
+        {
+            "IfName": "eth1",
+            "Name": "Management2",
+            "IsMgmt": true,
+            "IsL3Port": true,
+            "Dhcp": 4,
+            "Free": true
+        }
+    ]
+}

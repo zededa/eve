@@ -1,0 +1,17 @@
+# EVE-OS USB CDC-ECM gadget auto-bring-up rule for NVIDIA Spark (HP ZGX Nano G1n).
+#
+# When piKVM is connected via USB OTG to the Spark device, the kernel creates a
+# usb0 (cdc_ether) interface. This rule ensures the interface is brought UP
+# automatically so EVE's nim can use it as a management path for initial
+# controller connectivity before physical ethernet is configured.
+#
+# The piKVM dnsmasq assigns 172.30.30.x via DHCP and advertises DNS servers
+# (8.8.8.8, 8.8.4.4) so EVE can resolve zedcloud.alpha.zededa.net.
+#
+# Prerequisite on piKVM: /usr/lib/python3.13/site-packages/kvmd/apps/__init__.py
+# must have "--dhcp-option=6,8.8.8.8,8.8.4.4" (not just "--dhcp-option=6").
+# See: pkg/pillar/docs/zededa-spark-pikvm-setup.md
+
+SUBSYSTEM=="net", ACTION=="add", KERNEL=="usb0", \
+  DRIVERS=="cdc_ether", \
+  RUN+="/sbin/ip link set usb0 up"
