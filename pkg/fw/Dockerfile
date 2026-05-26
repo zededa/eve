@@ -43,6 +43,12 @@ FROM build-base AS nvidia-jp7
 ENV NVIDIA_FW_TEGRA=${JETPACK7_DEB}
 ENV NVIDIA_FW_URL=${JETPACK7_URL}
 
+# DGX Spark uses datacenter NVIDIA drivers, not Jetpack/L4T firmware
+# Re-use generic Linux firmware; no Tegra-specific firmware bundle needed
+FROM build-base AS nvidia-spark
+ENV NVIDIA_FW_TEGRA=${JETPACK5_DEB}
+ENV NVIDIA_FW_URL=${JETPACK5_URL}
+
 FROM ${PLATFORM} AS build
 
 ADD ${NVIDIA_FW_URL} /${NVIDIA_FW_TEGRA}
@@ -229,6 +235,7 @@ FROM compactor-common AS compactor-generic
 FROM compactor-common AS compactor-nvidia-jp5
 FROM compactor-common AS compactor-nvidia-jp6
 FROM compactor-common AS compactor-nvidia-jp7
+FROM compactor-common AS compactor-nvidia-spark
 FROM compactor-full AS compactor-evaluation
 
 FROM compactor-${PLATFORM} AS compactor
