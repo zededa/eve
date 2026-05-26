@@ -26,9 +26,11 @@
 #   curl, jq, ssh (with piKVM root key or password)
 #
 # HARDWARE NOTE for HP ZGX Nano G1n:
-#   eth0/eth1 — 1GbE RJ45 copper (standard LAN cable goes here)
-#   eth2/eth3 — 25GbE SFP28 fiber (CANNOT use RJ45 cable here!)
+#   eth0-eth3 — ALL are NVIDIA P4242-0000, 2-port QSFP28 up to 200G
+#               NO RJ45 ports at all! Requires QSFP28 DAC cable or fiber.
+#               A standard RJ45 ethernet cable will NEVER work on any port.
 #   usb0      — piKVM USB CDC-ECM gadget (172.30.30.x subnet)
+#               Only path for onboarding without QSFP28 hardware.
 #
 # piKVM USB CDC-ECM:
 #   piKVM side: 172.30.30.1

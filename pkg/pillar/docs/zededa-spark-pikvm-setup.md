@@ -4,15 +4,22 @@
 
 The **HP ZGX Nano G1n** running NVIDIA Spark (EVE-OS) has the following network interfaces:
 
-| Interface | Driver     | Type          | Connector | Notes                          |
-|-----------|------------|---------------|-----------|--------------------------------|
-| eth0      | igc        | 1GbE copper   | RJ45      | Standard LAN cable goes here   |
-| eth1      | igc        | 1GbE copper   | RJ45      | Secondary LAN                  |
-| eth2      | mlx5_core  | 25GbE fiber   | SFP28     | DAC or fiber only, NOT RJ45    |
-| eth3      | mlx5_core  | 25GbE fiber   | SFP28     | DAC or fiber only, NOT RJ45    |
-| usb0      | cdc_ether  | USB gadget    | piKVM USB | 172.30.30.x subnet             |
+| Interface | Driver     | Type           | Connector | Notes                                          |
+|-----------|------------|----------------|-----------|------------------------------------------------|
+| eth0      | mlx5_core  | 200GbE         | QSFP28    | P4242-0000 NIC port 0 — NO RJ45, DAC/fiber only |
+| eth1      | mlx5_core  | 200GbE         | QSFP28    | P4242-0000 NIC port 1 — NO RJ45, DAC/fiber only |
+| eth2      | mlx5_core  | 200GbE         | QSFP28    | P4242-0000 NIC port 0 — NO RJ45, DAC/fiber only |
+| eth3      | mlx5_core  | 200GbE         | QSFP28    | P4242-0000 NIC port 1 — NO RJ45, DAC/fiber only |
+| usb0      | cdc_ether  | USB gadget     | piKVM USB | 172.30.30.x subnet                             |
 
-**IMPORTANT:** eth2 and eth3 are SFP28 fiber ports. Plugging an RJ45 (copper ethernet) cable into them will NOT work. Always use eth0 or eth1 for standard 1GbE LAN connections.
+**CRITICAL — NO RJ45 PORTS:** The HP ZGX Nano G1n uses **NVIDIA P4242-0000** NICs — 2-port QSFP28 up to 200G. This is **different from the consumer NVIDIA DGX Spark** which has a 10GbE RJ45. All 4 physical ethernet ports on this device require QSFP28 connectors. A standard RJ45 ethernet cable will NEVER produce a link.
+
+**To use physical ethernet you need one of:**
+- QSFP28 to QSFP28 DAC (Direct Attach Copper) twinax cable — plugs into QSFP cage on both ends
+- QSFP28 → 10GBASE-T RJ45 transceiver module — gives you an RJ45 port from a QSFP cage
+- QSFP28 fiber transceiver + fiber cable
+
+**For initial onboarding, use usb0 (piKVM CDC-ECM) as the management path — it works without any special cables.**
 
 ## piKVM v4 MINI Setup
 
@@ -156,11 +163,16 @@ INFO: Port usb0: link: up use: mgmt 172.30.30.124
 INFO: Port eth0: link: up use: mgmt 192.168.x.x
 ```
 
-### eth0/eth1 show NO-CARRIER
+### eth0/eth1/eth2/eth3 show NO-CARRIER
 
-- Verify cable is in an **RJ45 port** (eth0 or eth1), not the SFP28 cages (eth2/eth3)
-- Verify the switch port on the other end shows a link LED
-- Try a different cable
+The HP ZGX Nano G1n has **NO RJ45 ethernet ports**. All 4 NICs are NVIDIA P4242-0000 (2-port QSFP28, up to 200G). A standard RJ45 ethernet cable will never produce a link on any port.
+
+To use physical ethernet you need:
+- **QSFP28 DAC cable** — twinax cable with QSFP28 connectors on both ends (cheapest, for short runs)
+- **QSFP28 → 10GBASE-T transceiver** — lets you use a regular RJ45 cable into a QSFP28 cage
+- **QSFP28 SR transceiver + fiber** — for longer runs
+
+For initial onboarding, use `usb0` via piKVM CDC-ECM (172.30.30.x). No special cables needed.
 
 ### EVE cannot resolve zedcloud.alpha.zededa.net
 

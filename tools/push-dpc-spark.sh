@@ -16,9 +16,11 @@
 #   curl, jq
 #
 # The HP ZGX Nano G1n has:
-#   eth0/eth1 — 1GbE RJ45 copper ports  (use these for normal LAN)
-#   eth2/eth3 — 25GbE SFP28 fiber ports (need DAC cable or fiber, NOT RJ45)
+#   eth0-eth3 — ALL are NVIDIA P4242-0000, 2-port QSFP28 up to 200G
+#               NO RJ45 ports at all! Requires QSFP28 DAC cable or fiber.
+#               Standard RJ45 ethernet cable will NEVER work on any of these.
 #   usb0      — piKVM USB CDC-ECM gadget (172.30.30.x, management-only)
+#               This is the ONLY way to onboard without special QSFP28 cables.
 #
 # This script pushes a DPC that marks usb0 + eth0 as management interfaces,
 # bypassing the ZEDEDA UI validation that requires a "Network" object.
